@@ -25,14 +25,17 @@ export async function contarUnidades(scope: TenantScope): Promise<number> {
 }
 
 export async function buscarFiliaisParaEscolha(scope: TenantScope, membershipId: string) {
-  return withTenantDb(scope, async (db) => {
-    const acessos = await db.userBranchAccess.findMany({
-      where: { membershipId },
-      select: { branchId: true },
-    });
-    const liberadas = acessos.map((a) => a.branchId);
+  // UserBranchAccess não tem tenantId (é tabela de ligação), então usamos prismaCommon
+  // filtrando por membershipId (único global, já garante isolamento por tenant via membership)
+  const acessos = await prismaCommon.userBranchAccess.findMany({
+    where: { membershipId },
+    select: { branchId: true },
+  });
+  const liberadas = acessos.map((a) => a.branchId);
 
-    return db.branch.findMany({
+  // Branch TEM tenantId, então usa withTenantDb para o filtro de tenant
+  return withTenantDb(scope, (db) =>
+    db.branch.findMany({
       where: {
         tenantId: scope.tenantId,
         active: true,
@@ -41,8 +44,8 @@ export async function buscarFiliaisParaEscolha(scope: TenantScope, membershipId:
       },
       select: { id: true, name: true, code: true, isHeadquarters: true },
       orderBy: [{ isHeadquarters: "desc" }, { name: "asc" }],
-    });
-  });
+    })
+  );
 }
 
 export async function buscarFilialPorId(scope: TenantScope, branchId: string) {
