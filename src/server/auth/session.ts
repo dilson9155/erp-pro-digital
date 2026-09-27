@@ -24,9 +24,15 @@
 import { SessionStatus, UserStatus } from "@/generated/prisma/enums";
 import type { Session } from "@/generated/prisma/client";
 
+import { redirect } from "next/navigation";
+import { headers } from "next/headers";
 import { env } from "@/lib/env";
 import { prismaCommon } from "@/server/db/client";
 import { generateSessionToken, hashSessionToken } from "@/server/auth/session-token";
+import { readSessionToken, clearSessionCookie } from "@/server/auth/cookie";
+import { log as criarLog } from "@/lib/logger";
+
+const log = criarLog("auth.session");
 
 /** Dados que o chamador (login, fluxo de tenant, impersonacao) ja tem. */
 export interface CreateSessionInput {
@@ -46,6 +52,16 @@ export interface AuthenticatedUser {
   readonly id: string;
   readonly email: string;
   readonly name: string;
+  /**
+   * Status da conta no momento da autenticacao.
+   *
+   * Esta no contrato porque `decidirAcesso` PRECISA dele para responder "acesso",
+   * "troca de senha" ou "negado". Sem o campo, todo consumidor teria de buscar o
+   * usuario de novo, e a checagem de status deixaria de ser uma consequencia da
+   * autenticacao para virar uma consulta a parte — que e como uma sessao revogada
+   * por mudanca de status sobrevive ate a proxima navegacao.
+   */
+  readonly status: UserStatus;
   readonly isPlatformAdmin: boolean;
   readonly mustChangePassword: boolean;
   readonly hasTotp: boolean;
@@ -189,6 +205,7 @@ export async function authenticateSession(
     id: record.user.id,
     email: record.user.email,
     name: record.user.name,
+    status: record.user.status,
     isPlatformAdmin: record.user.isPlatformAdmin,
     mustChangePassword: record.user.mustChangePassword,
     hasTotp: record.user.totpEnabledAt !== null,
@@ -252,4 +269,160 @@ export async function revokeAllSessions(
     data: { status: SessionStatus.REVOGADA, revokedAt: new Date(), revokedReason: reason },
   });
   return result.count;
+}
+
+/**
+ * Escolhe a empresa (e a filial) em que a sessao vai trabalhar.
+ *
+ * POR QUE ISTO E UMA funCAO E NAO UM `session.update` NA ACTION
+ *
+ * A action da tela de escolha tem um `membershipId` vindo do FORMULARIO, e esse
+ * id decide qual empresa a pessoa vai enxergar. Confiar no id do formulario e
+ * aceitar: qualquer pessoa trocaria o valor no devtools e abriria a empresa de
+ * outra pessoa. Por isso a validacao mora AQUI, e a unica coisa que a action
+ * precisa e dizer e "a sessao `X` escolheu a membership `Y`".
+ *
+ * A verificacao tem DUAS partes, e a segunda e a que costuma faltar:
+ *
+ *  1. a membership pertence a este `userId`?  (impede trocar de empresa)
+ *  2. a membership esta ativa e a empresa nao esta deletada?  (impede entrar
+ *     numa empresa desligada)
+ *
+ * Sem a 2, bastava desativar a membership de alguém e a sessao continuaria
+ * apontando para ela: o `Membership` deixaria de ser consultado em pedido
+ * posterior, mas a sessao ja carregaria o `tenantId` — e o `tenant-guard`
+ * confia no escopo da sessao.
+ */
+export async function definirContextoSessao(input: {
+  sessionId: string;
+  userId: string;
+  membershipId: string;
+  branchId?: string | null;
+}): Promise<{ ok: true; branchId: string | null } | { ok: false; motivo: "vinculo_invalido" | "filial_invalida" }> {
+  const membership = await prismaCommon.membership.findFirst({
+    where: {
+      id: input.membershipId,
+      // Parte 1: a membership e desta pessoa.
+      userId: input.userId,
+      // Parte 2: membership viva e empresa viva.
+      active: true,
+      deletedAt: null,
+      tenant: { deletedAt: null, status: { not: "CANCELADA" } },
+    },
+    select: { id: true, tenantId: true, branchAccess: { select: { branchId: true } } },
+  });
+
+  if (!membership) return { ok: false, motivo: "vinculo_invalido" };
+
+  const branchId = input.branchId ?? null;
+
+  if (branchId !== null) {
+    // Convenção de `membership.ts`: `branchAccess` VAZIO significa "sem
+    // restrição declarada", ou seja, todas as filiais da empresa. Testar
+    // `.some()` direto rejeitaria justamente esse caso — a pessoa ficaria sem
+    // filial nenhuma e o layout a devolveria para esta tela para sempre.
+    const semRestricao = membership.branchAccess.length === 0;
+    const liberada = semRestricao || membership.branchAccess.some((b) => b.branchId === branchId);
+
+    // E a filial precisa ser DA EMPRESA (`tenantId`), não só estar viva: sem
+    // este `in`, uma filial de outra empresa seria aceita e a sessão passaria a
+    // operar no estoque errado.
+    const filial = await prismaCommon.branch.findFirst({
+      where: { id: branchId, tenantId: membership.tenantId, active: true, deletedAt: null },
+      select: { id: true },
+    });
+    if (!filial || !liberada) return { ok: false, motivo: "filial_invalida" };
+  } else if (membership.branchAccess.length > 0) {
+    // "Todas as filiais" é recusado para quem tem restrição: essa pessoa só
+    // enxerga as liberadas, e liberar o agregado seria ampliar o escopo dela.
+    return { ok: false, motivo: "filial_invalida" };
+  }
+
+  // `updateMany` com o `userId` no filtro: se a sessao nao for desta pessoa, o
+  // update nao casa com nada e `count === 0` — sem carregar a sessao antes para
+  // conferir. E a mesma razao do `touchSession`.
+  const resultado = await prismaCommon.session.updateMany({
+    where: { id: input.sessionId, userId: input.userId, status: SessionStatus.ATIVA },
+    data: { membershipId: membership.id, tenantId: membership.tenantId, branchId },
+  });
+
+  if (resultado.count === 0) return { ok: false, motivo: "vinculo_invalido" };
+  return { ok: true, branchId };
+}
+
+/**
+ * Ações de escolha de contexto: empresa, filial e logout.
+ *
+ * Moram aqui (em `session.ts`) porque operam sobre a sessão, e `definirContextoSessao`
+ * já vive neste módulo. O bridge `@/server/app/auth` re-exporta estas funções.
+ * Manter tudo junto evita o `import("@/server/auth/session").then(...)` dinâmico
+ * que a versão anterior usava para `revokeSession`.
+ */
+
+async function sessaoAtual() {
+  const token = await readSessionToken();
+  if (!token) return null;
+  return authenticateSession(token);
+}
+
+/** Escolhe a empresa e redireciona para escolha de filial. */
+export async function escolherEmpresa(formData: FormData): Promise<void> {
+  const sessao = await sessaoAtual();
+  if (!sessao) redirect("/login");
+
+  const membershipId = String(formData.get("membershipId") ?? "");
+  if (!membershipId) redirect("/login");
+
+  const resultado = await definirContextoSessao({
+    sessionId: sessao.session.id,
+    userId: sessao.user.id,
+    membershipId,
+  });
+
+  if (!resultado.ok) {
+    log.warn({ motivo: resultado.motivo }, "escolha_empresa_negada");
+    redirect("/login");
+  }
+
+  redirect("/escolher-filial");
+}
+
+/** Escolhe a filial. `null` = "todas as filiais". */
+export async function escolherFilial(formData: FormData): Promise<void> {
+  const sessao = await sessaoAtual();
+  if (!sessao || sessao.session.tenantId === null) redirect("/login");
+
+  const bruto = String(formData.get("branchId") ?? "");
+  const branchId = bruto === "" || bruto === "todas" ? null : bruto;
+
+  const resultado = await definirContextoSessao({
+    sessionId: sessao.session.id,
+    userId: sessao.user.id,
+    membershipId: sessao.session.membershipId ?? "",
+    branchId,
+  });
+
+  if (!resultado.ok) {
+    log.warn({ motivo: resultado.motivo }, "escolha_filial_negada");
+    redirect("/escolher-filial");
+  }
+
+  redirect("/dashboard");
+}
+
+/** Encerra a sessão (logout). */
+export async function encerrarSessao(): Promise<void> {
+  const token = await readSessionToken();
+  if (token) {
+    const sessao = await authenticateSession(token);
+    if (sessao) await revokeSession(sessao.session.id, "logout");
+  }
+  await clearSessionCookie();
+  log.info({}, "logout");
+  redirect("/login");
+}
+
+/** User-Agent, para log. */
+export async function userAgent(): Promise<string | null> {
+  return (await headers()).get("user-agent");
 }

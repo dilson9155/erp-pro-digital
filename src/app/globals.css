@@ -1,0 +1,117 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * Tokens de tema.
+ *
+ * O nome e o valor sao a mesma coisa, com uma excecao: as classes utilitarias
+ * do Tailwind (`bg-primary`, `text-muted-foreground`) leem o token, e nao o
+ * valor. Assim, trocar a paleta inteira e uma edicao de variavel, e nao uma
+ * busca e troca em hundreds de classes.
+ *
+ * A paleta por EMPRESA entra em runtime: `Tenant.primaryColor` e injetada como
+ * `--primary` pelo layout (ver `src/app/layout.tsx`). O valor abaixo e o fallback
+ * da marca, de `src/config/branding.ts`.
+ *
+ * Formato `hsl(...)` sem os tres numeros soltos e uma escolha do shadcn para
+ * que o canal de alfa funcione com `/50`, `/10` e afins — que e como o
+ * Tailwind v4 aplica opacidade em cor customizada.
+ */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+
+  --background: hsl(0 0% 100%);
+  --foreground: hsl(222 47% 11%);
+  --card: hsl(0 0% 100%);
+  --card-foreground: hsl(222 47% 11%);
+  --popover: hsl(0 0% 100%);
+  --popover-foreground: hsl(222 47% 11%);
+
+  /* Fallback da marca. Sobrescrito por tenant no layout. */
+  --primary: hsl(222 47% 31%);
+  --primary-foreground: hsl(210 40% 98%);
+
+  --secondary: hsl(210 40% 96%);
+  --secondary-foreground: hsl(222 47% 11%);
+  --muted: hsl(210 40% 96%);
+  --muted-foreground: hsl(215 16% 47%);
+  --accent: hsl(210 40% 96%);
+  --accent-foreground: hsl(222 47% 11%);
+  --destructive: hsl(0 72% 51%);
+  --destructive-foreground: hsl(210 40% 98%);
+
+  --border: hsl(214 32% 91%);
+  --input: hsl(214 32% 91%);
+  --ring: hsl(222 47% 31%);
+}
+
+.dark {
+  --background: hsl(222 47% 8%);
+  --foreground: hsl(210 40% 98%);
+  --card: hsl(222 45% 11%);
+  --card-foreground: hsl(210 40% 98%);
+  --popover: hsl(222 45% 11%);
+  --popover-foreground: hsl(210 40% 98%);
+
+  --primary: hsl(210 40% 98%);
+  --primary-foreground: hsl(222 47% 11%);
+
+  --secondary: hsl(217 33% 17%);
+  --secondary-foreground: hsl(210 40% 98%);
+  --muted: hsl(217 33% 17%);
+  --muted-foreground: hsl(215 20% 65%);
+  --accent: hsl(217 33% 17%);
+  --accent-foreground: hsl(210 40% 98%);
+  --destructive: hsl(0 63% 50%);
+  --destructive-foreground: hsl(210 40% 98%);
+
+  --border: hsl(217 33% 20%);
+  --input: hsl(217 33% 20%);
+  --ring: hsl(213 27% 70%);
+}
+
+@layer base {
+  /*
+   * `border-border` em vez de `border` puro.
+   *
+   * O Tailpad preflight zera a cor da borda, o que faria toda `border` de todo
+   * componente sair cinza-claro do sistema em vez do token. Declarar o default
+   * aqui e o que faz `border` significar "a cor do tema" sem repetir a classe em
+   * cada lugar.
+   */
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+  }
+}

@@ -28,7 +28,25 @@ import nextTypeScript from "eslint-config-next/typescript";
 const restricoesSrc = {
   patterns: [
     {
-      group: ["@/server/*", "@/server/**"],
+      // Lista explícita dos submódulos de servidor proibidos fora de src/server/.
+      // O @/server/app/ É O BRIDGE AUTORIZADO: módulos "use server" que a camada
+      // app (src/app/**) pode importar. NÃO adicione @/server/db/**, @/server/auth/**,
+      // @/server/rate-limit/**, @/server/lockout/** aqui — eles continuam bloqueados
+      // pela lista abaixo. Se um novo submódulo de servidor precisar ser acessado
+      // pelo app, a decisão de expor ou não passa por este arquivo (e não por um
+      // eslint-disable ad-hoc no consumidor).
+      group: [
+        "@/server/db/*",
+        "@/server/db/**",
+        "@/server/auth/*",
+        "@/server/auth/**",
+        "@/server/rate-limit/*",
+        "@/server/rate-limit/**",
+        "@/server/lockout/*",
+        "@/server/lockout/**",
+        "@/server/totp-service/*",
+        "@/server/totp-service/**",
+      ],
       message:
         "Modulo de servidor nao pode ser importado fora de src/server/. Use uma Server Action ou uma Route Handler.",
     },
@@ -212,7 +230,15 @@ const eslintConfig = [
     // Os dois arquivos legitimamente autorizados a tocar no client sem escopo:
     // `scoped.ts` o consome para construir o client protegido, e a autenticacao
     // o consome porque login acontece antes de existir empresa.
-    files: ["src/server/auth/**/*.{ts,tsx}", "src/server/db/scoped.ts"],
+    //
+    // `src/server/app/**` é a camada de bridge (actions + queries) que o app
+    // importa. Ela PRECISA acessar prismaCommon, auth modules, etc. para
+    // implementar as queries/actions. O app nunca importa esses módulos direto.
+    files: [
+      "src/server/auth/**/*.{ts,tsx}",
+      "src/server/db/scoped.ts",
+      "src/server/app/**/*.{ts,tsx}",
+    ],
     rules: {
       "no-restricted-imports": "off",
     },
