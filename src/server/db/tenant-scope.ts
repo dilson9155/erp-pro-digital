@@ -96,7 +96,12 @@ export function requireTenantScope(): TenantScope {
  * simultaneas nao se misturam porque cada uma tem seu contexto async.
  */
 export function runWithTenantScope<T>(scope: TenantScope, fn: () => Promise<T>): Promise<T> {
-  return storage.run(scope, fn);
+  // O callback DEVE ser async para que o AsyncLocalStorage preserve o contexto
+  // durante toda a execução assíncrona. Sem o `await`, o contexto é perdido
+  // logo após o callback síncrono retornar a Promise.
+  return storage.run(scope, async () => {
+    return await fn();
+  });
 }
 
 /** Igual a `runWithTenantScope`, para callbacks sincronos. */
