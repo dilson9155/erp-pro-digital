@@ -819,8 +819,11 @@ model Permission {
   description  String?
   /// Agrupamento para a tela de configuração de perfis (ex.: "Vendas", "Fiscal").
   group        String   @db.VarChar(60)
-  /// Ações cobertas: ["create","read","update","delete","approve","cancel","export"].
-  actions      String[]
+  /// Catálogo de ações que ESTE RECURSO SUPORTA. Não é o que um perfil recebe:
+  /// quem recebe é `RolePermission.actions`. Este array existe para a tela de
+  /// perfis saber quais checkboxes oferecer — e, mais importante, para o código
+  /// recusar uma concessão de ação que o recurso nem implementa.
+  availableActions String[] @map("available_actions")
   /// Somente o super admin da plataforma pode conceder esta permissão.
   platformOnly Boolean  @default(false) @map("platform_only")
 
@@ -863,6 +866,25 @@ model Role {
 model RolePermission {
   roleId       String @map("role_id")
   permissionId String @map("permission_id")
+  /// Ações que ESTE PERFIL concede sobre o recurso. Subconjunto de
+  /// `Permission.availableActions` — o vínculo, não a permissão, é quem tem
+  /// granularidade.
+  ///
+  /// POR QUE ISTO AQUI E NÃO EM `Permission.actions`
+  ///
+  /// `Permission` é global (não tem `tenantId`) e `key` é único: existe uma
+  /// linha só por recurso, em toda a plataforma. Com as ações no `Permission`,
+  /// qualquer perfil que possa *ler* uma venda poderia também *apagar* e
+  /// *aprovar* — e não há como granularizar, porque todos os perfis apontam
+  /// para a mesma linha. Vendedor, gerente e auditor ficariam com exatamente o
+  /// mesmo poder sobre o recurso, e a tela de perfis viraria decoração.
+  ///
+  /// A divisão é: `Permission` descreve o recurso e as ações que ele suporta
+  /// (para a UI oferecer as caixas certas e o servidor recusar ação
+  /// inexistente); `RolePermission.actions` é o subconjunto que este perfil
+  /// recebe. Um perfil pode concedear `["create","read"]` e outro
+  /// `["read","update","approve"]` sobre o mesmo recurso.
+  actions String[]
 
   role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
   permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)

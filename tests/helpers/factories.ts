@@ -20,7 +20,9 @@
 import bcrypt from "bcryptjs";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/generated/prisma/client";
+import type { PlanModuleKey, SubscriptionStatus } from "@/generated/prisma/enums";
 import { hashPassword } from "@/lib/auth/password";
+import { ACOES } from "@/lib/rbac/permissions";
 
 /**
  * Client CRU, sem a extensao de tenant.
@@ -228,4 +230,143 @@ export async function createTenantWithBranch() {
   const company = await createCompany(tenant.id);
   const branch = await createBranch(tenant.id, company.id);
   return { tenant, company, branch };
+}
+
+/**
+ * Assinatura com os modulos contratados.
+ *
+ * Existe porque o gate de plano do RBAC consulta a `Subscription`, nao o espelho
+ * `Tenant.subscriptionStatus`: o preco e congelado na assinatura, e e ela a
+ * fonte da verdade. Um tenant de teste SEM assinatura e, para o RBAC, um tenant
+ * que nao contratou nada — e o teste precisa criar a assinatura explicitamente
+ * para nao estar medindo o caso errado.
+ *
+ * Os modulos vao em `PlanModule` (o contrato) e nao em flags do tenant, porque
+ * e no plano que o upgrade acontece.
+ */
+export async function createSubscription(
+  tenantId: string,
+  modulos: readonly PlanModuleKey[] = [],
+  status: SubscriptionStatus = "ATIVA",
+) {
+  const tenant = await testDb().tenant.findUniqueOrThrow({
+    where: { id: tenantId },
+    select: { planId: true },
+  });
+
+  // `PlanModule` tem PK composta `[planId, module]`, entao um modulo repetido
+  // estouraria P2002. Deduplica aqui para o chamador poder passar a lista que
+  // quiser sem se preocupar.
+  const unicos = [...new Set(modulos)];
+
+  await testDb().planModule.createMany({
+    data: unicos.map((module) => ({ planId: tenant.planId, module })),
+  });
+
+  return testDb().subscription.create({
+    data: {
+      tenantId,
+      planId: tenant.planId,
+      status,
+      startedAt: new Date("2024-01-01T00:00:00Z"),
+      currentPeriodStart: new Date("2024-01-01T00:00:00Z"),
+      currentPeriodEnd: new Date("2025-01-01T00:00:00Z"),
+    },
+  });
+}
+
+/** Opcoes de `createRole`. */
+export interface RoleOverrides {
+  readonly tenantId?: string | null;
+  readonly slug?: string;
+  readonly scope?: "PLATFORM" | "TENANT" | "SYSTEM";
+  readonly active?: boolean;
+  readonly deletedAt?: Date | null;
+  readonly isSystem?: boolean;
+}
+
+/** Uma concessão: recurso, módulo e as ações que ESTE perfil recebe. */
+export interface PermissaoSpec {
+  readonly key: string;
+  readonly module: string;
+  /** Ações concedidas por este perfil. Subconjunto de `availableActions`. */
+  readonly actions: readonly string[];
+  /**
+   * Catálogo de ações do recurso. Padrao: as sete canônicas.
+   *
+   * Existe para o teste conseguir montar um recurso que NAO suporta uma ação
+   * (ex.: `availableActions: ["read"]` para algo sem approve) e comprovar que a
+   * concessão de uma ação fora do catálogo é recusada.
+   */
+  readonly availableActions?: readonly string[];
+}
+
+/**
+ * Perfil, com as concessões que ele concede.
+ *
+ * `availableActions` e `actions` são coisas diferentes e a separação é o que dá
+ * granularidade ao RBAC: a primeira é o catálogo do recurso (global, uma linha
+ * por recurso em toda a plataforma) e a segunda é o que este perfil recebe. Dois
+ * perfis sobre `VENDAS.venda` podem receber conjuntos diferentes — se as ações
+ * estivessem só na permissão, ambos herdariam exatamente o mesmo poder.
+ */
+export async function createRole(
+  permissoes: readonly PermissaoSpec[],
+  options: RoleOverrides = {},
+) {
+  const role = await testDb().role.create({
+    data: {
+      tenantId: options.tenantId ?? null,
+      name: options.slug ?? `Perfil ${unique()}`,
+      slug: options.slug ?? `perfil-${unique()}`,
+      scope: options.scope ?? "TENANT",
+      active: options.active ?? true,
+      isSystem: options.isSystem ?? false,
+      deletedAt: options.deletedAt ?? null,
+    },
+  });
+
+  for (const p of permissoes) {
+    const catalogo = p.availableActions ?? ACOES;
+
+    // Subconjunto inválido é erro de DADO do teste, e falhar aqui é melhor que
+    // criar uma concessão que o banco aceita e o produto jamais deveria ter
+    // criado: a gravação de perfil tem de recusar ação fora do catálogo, e o
+    // teste que fiscaliza essa regra precisa de um caminho que a produza.
+    for (const acao of p.actions) {
+      if (!catalogo.includes(acao)) {
+        throw new Error(
+          `createRole: "${p.key}" concede "${acao}", que nao esta em availableActions [${catalogo.join(", ")}]`,
+        );
+      }
+    }
+
+    // `key` é `@unique` global: o mesmo recurso em vários perfis aponta para a
+    // MESMA linha de `Permission`, e o que difere é o vínculo. Por isso o
+    // `upsert` só cria — o `update` do catálogo viraria uma corrida entre testes
+    // que usam o mesmo recurso com catálogos diferentes, e o último a escrever
+    // determinaria o resultado do primeiro.
+    const permissao = await testDb().permission.upsert({
+      where: { key: p.key },
+      create: {
+        key: p.key,
+        module: p.module,
+        label: p.key,
+        group: p.module,
+        availableActions: [...catalogo],
+      },
+      update: {},
+    });
+
+    await testDb().rolePermission.create({
+      data: { roleId: role.id, permissionId: permissao.id, actions: [...p.actions] },
+    });
+  }
+
+  return role;
+}
+
+/** Liga um perfil a uma membership. */
+export async function attachRole(membershipId: string, roleId: string) {
+  return testDb().membershipRole.create({ data: { membershipId, roleId } });
 }
