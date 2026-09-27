@@ -1,0 +1,29 @@
+# Forca LF no repositorio, em qualquer sistema operacional.
+#
+# Contexto que justifica o arquivo: existe um gate de encoding
+# (`scripts/check-encoding.mts`) que reprova corrupcao de texto, e ele foi
+# criado porque ja houve mojibake em Commentarios. O modo de falha mais comum
+# dessa corrupcao NAO e o editor: e uma ferramenta que le o arquivo com a
+# codificacao errada e regrava. No Windows, `core.autocrlf=true` faz o Git
+# regravar todo arquivo versionado com CRLF, e ai entra a combinacao de
+# `Get-Content` + `Set-Content` que produz exatamente a corrupcao vista.
+#
+# Fixar LF deixa o byte do arquivo identico entre clone, checkout e
+# containers, entao a corrupcao deixa de depender de onde o codigo foi escrito.
+* text=auto eol=lf
+
+# Arquivos que nao sao texto: nunca devem ser normalizados nem ter
+# quebras de linha inseridas.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.zip binary
+
+# Lockfile: gerado, gigante, e um byte a mais causa conflito em todo merge.
+package-lock.json -diff

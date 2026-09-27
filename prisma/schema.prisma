@@ -1,0 +1,4419 @@
+// ============================================================================
+// ERP PRO DIGITAL — Schema Prisma (PostgreSQL)
+// ============================================================================
+//
+// REGRAS INEGOCIÁVEIS DESTE SCHEMA
+//
+// 1. MULTI-TENANCY
+//    Todo modelo de negócio tem `tenantId` NÃO NULO e indexado. Modelos de
+//    plataforma (Plan, FiscalProvider, Ncm, Municipality, Permission,
+//    PlatformSetting) NÃO têm `tenantId` — são compartilhados entre empresas.
+//
+// 2. DINHEIRO NUNCA É FLOAT
+//    Valores monetários usam `@db.Decimal`. Totais e saldos: (14,2).
+//    Preços e custos unitários: (14,4) — permite custo por unidade fracionada.
+//    Quantidades: `@db.Decimal(14,4)`. Todo cálculo em JS usa `decimal.js`
+//    (ver `src/lib/money.ts`). Nunca `Number` para dinheiro.
+//
+// 3. DOCUMENTO FISCAL NUNCA É APAGADO
+//    `Invoice`, `InvoiceItem`, `InvoiceEvent`, `FiscalLog` e o XML só usam
+//    `retentionUntil`/`archivedAt` para descarte. A obrigação legal de
+//    preservação (CTN art. 173/174, CT-e, NFS-e) prevalece sobre LGPD.
+//
+// 4. TRIBUTAÇÃO NÃO É CODIFICADA AQUI
+//    NCM, CEST, CFOP, CST, CSOSN e alíquotas vivem no banco e são mantidos
+//    pelo contador. Nenhuma alíquota é hardcoded na aplicação. As alíquotas
+//    do IBS/CBS/Imposto Seletivo (Reforma Tributária) ficam em `TaxRule`,
+//    versionadas por `validFrom`/`validTo` — sem alteração de schema quando
+//    as regras mudarem.
+//
+// 5. SOFT DELETE
+//    `deletedAt` onde há valor histórico/legal. O client Prisma estendido de
+//    tenant aplica `deletedAt: null` nos modelos marcados como soft-delete.
+//
+// 6. AUDITORIA
+//    `AuditLog.userId` é NULLABLE com `onDelete: SetNull` e o nome do usuário
+//    é desnormalizado. Apagar um usuário NUNCA destrói o rastro de auditoria.
+//
+// 7. CONCORRÊNCIA
+//    Toda entidade numerada tem índice único composto e o número é alocado
+//    dentro de transação com lock pessimista sobre `NumberSequence`
+//    (`SELECT ... FOR UPDATE`). Ver `src/server/modules/numbering`.
+//
+// 8. NOMES FÍSICOS EM SNAKE_CASE
+//    Todo campo tem `@map` e todo model tem `@@map`, para que ferramentas de
+//    BI (Metabase, Power BI, DBeaver) funcionem sem dicionário de dados.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// ENUMS — Identidade, acesso e auditoria
+// ============================================================================
+
+enum TaxRegime {
+  /// Alíquota efetiva definida pelo Anexo do Simples Nacional, por standstill.
+  SIMPLES_NACIONAL
+  /// Empresa que excedeu o sublimite de receita bruta do Simples Nacional.
+  SIMPLES_EXCESSO_SUBLIMITE
+  /// Lucro Presumido ou Lucro Real (regime normal).
+  REGIME_NORMAL
+  MEI
+}
+
+enum PersonType {
+  FISICA
+  JURIDICA
+}
+
+enum AddressKind {
+  RESIDENCIAL
+  COMERCIAL
+  RETIRADA
+  ENTREGA
+  OUTRO
+}
+
+/// Tag `idDest` da NF-e. NULL = não informado (aceito pelo schema, validado
+/// pelo provedor no momento da emissão).
+enum FiscalAddressKind {
+  BRASIL
+  EXTERIOR
+}
+
+enum BrazilState {
+  AC
+  AL
+  AP
+  AM
+  BA
+  CE
+  DF
+  ES
+  GO
+  MA
+  MT
+  MS
+  MG
+  PA
+  PB
+  PR
+  PE
+  PI
+  RJ
+  RN
+  RS
+  RO
+  RR
+  SC
+  SP
+  SE
+  TO
+}
+
+enum UserStatus {
+  ATIVO
+  INATIVO
+  BLOQUEADO
+  PENDENTE_ATIVACAO
+}
+
+enum RoleScope {
+  /// Super admin da plataforma SaaS.
+  PLATFORM
+  /// Perfil dentro de uma empresa.
+  TENANT
+  /// Papel interno do motor (ex.: "sistema-fiscal").
+  SYSTEM
+}
+
+enum SessionStatus {
+  ATIVA
+  REVOGADA
+  EXPIRADA
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  LOGIN_FALHO
+  LOGOUT_TODOS_DISPOSITIVOS
+  SENHA_ALTERADA
+  SENHA_REDEFINIDA
+  RECUPERACAO_SOLICITADA
+  TOTP_HABILITADO
+  TOTP_REMOVIDO
+  CRIAR
+  ALTERAR
+  EXCLUIR
+  RESTAURAR
+  CANCELAR
+  ESTORNAR
+  BAIXA
+  APROVAR
+  REJEITAR
+  EMITIR_DOCUMENTO
+  CONSULTAR_DOCUMENTO
+  IMPORTAR
+  EXPORTAR
+  IMPRIMIR
+  ENTRADA_ESTOQUE
+  SAIDA_ESTOQUE
+  TRANSFERIR_ESTOQUE
+  AJUSTAR_ESTOQUE
+  INVENTARIO
+  ALTERAR_PERMISSAO
+  ALTERACAO_FINANCEIRA
+  ACESSO_NEGADO
+  CONFIGURAR
+  ANONIMIZAR
+  EXPORTAR_DADOS
+  ASSINATURA
+  LIMITES_PLANO
+}
+
+enum LegalBasis {
+  CONSENTIMENTO
+  EXECUCAO_CONTRATO
+  OBRIGACAO_LEGAL
+  OBRIGACAO_REGULATARIA
+  INTERESSE_LEGITIMO
+  EXERCICIO_DIREITOS
+  PROTECCAO_CREDITO
+}
+
+enum DataSubjectRequestType {
+  ACESSO
+  CORRECAO
+  ANONIMIZACAO
+  PORTABILIDADE
+  ELIMINACAO
+  REVOGACAO_CONSENTIMENTO
+}
+
+enum DataSubjectRequestStatus {
+  ABERTA
+  EM_ANALISE
+  CONCLUIDA
+  RECUSADA
+  CANCELADA
+}
+
+// ============================================================================
+// ENUMS — SaaS / plataforma
+// ============================================================================
+
+enum TenantStatus {
+  PENDENTE
+  ATIVA
+  /// Em trial. Duração vem de `Plan.trialDays` (configurável, não fixo no código).
+  TRIAL
+  SUSPENSA
+  CANCELADA
+}
+
+enum SubscriptionStatus {
+  ATIVA
+  PENDENTE
+  ATRASADA
+  CANCELADA
+  BLOQUEADA
+  TRIAL
+}
+
+enum BillingPeriod {
+  DIARIO
+  SEMANAL
+  MENSAL
+  TRIMESTRAL
+  SEMESTRAL
+  ANUAL
+}
+
+enum BillingInvoiceStatus {
+  PENDENTE
+  PAGA
+  VENCIDA
+  CANCELADA
+  ESTORNADA
+}
+
+/// Módulos que um plano pode habilitar. Habilitar/desabilitar um módulo é
+/// decisão comercial da plataforma — o sistema consulta `Plan.modules` no
+/// servidor antes de executar qualquer operação do módulo.
+enum PlanModuleKey {
+  DASHBOARD
+  VENDAS
+  PDV
+  ORCAMENTOS
+  PEDIDOS
+  DEVOLUCOES
+  COMPRAS
+  ESTOQUE
+  INVENTARIO
+  TRANSFERENCIAS
+  CLIENTES
+  FORNECEDORES
+  FINANCEIRO
+  CONTAS_A_RECEBER
+  CONTAS_A_PAGAR
+  FLUXO_DE_CAIXA
+  PLANO_DE_CONTAS
+  DRE
+  COMISSOES
+  FISCAL
+  NFE
+  NFCE
+  NFSE
+  RELATORIOS
+  IMPORTACAO
+  EXPORTACAO
+  MULTI_FILIAL
+  API_PUBLICA
+  PWA
+  SUPORTE
+}
+
+enum TicketStatus {
+  ABERTO
+  EM_ATENDIMENTO
+  AGUARDANDO_CLIENTE
+  RESOLVIDO
+  FECHADO
+}
+
+enum TicketPriority {
+  BAIXA
+  MEDIA
+  ALTA
+  CRITICA
+}
+
+enum WelcomeTourState {
+  NAO_INICIADO
+  EM_ANDAMENTO
+  CONCLUIDO
+  IGNORADO
+}
+
+// ============================================================================
+// ENUMS — Cadastros e produtos
+// ============================================================================
+
+enum ProductType {
+  /// Mercadoria física com controle de estoque.
+  MERCADORIA
+  /// Item de NFS-e. Não movimenta estoque.
+  SERVICO
+  /// Kit/combo. Também não movimenta estoque próprio.
+  COMPOSTO
+}
+
+/// Origem da mercadoria (campo `orig` da NF-e). O valor default é apenas uma
+/// sugestão de cadastro — o contador confirma por NCM/CEST.
+enum ProductOrigin {
+  /// 0
+  NACIONAL
+  /// 1 - Estrangeira (importação direta)
+  ESTRANGEIRA_IMPORTACAO_DIRETA
+  /// 2 - Nacional, com Conteúdo de Importação superior a 40%
+  NACIONAL_CI_SUPERIOR_40
+  /// 3 - Estrangeira (adquirida no mercado interno)
+  ESTRANGEIRA_MERCADO_INTERNO
+  /// 4 - Nacional, produzida por processos produtivos básicos
+  NACIONAL_PROCESSOS_PRODUTIVOS_BASICOS
+  /// 5 - Nacional, com Conteúdo de Importação inferior a 40%
+  NACIONAL_CI_INFERIOR_40
+  /// 6 - Estrangeira (importação direta), sem similar nacional
+  ESTRANGEIRA_SEM_SIMILAR_NACIONAL
+  /// 7 - Estrangeira (adquirida no mercado interno), sem similar
+  ESTRANGEIRA_SEM_SIMILAR_MERCADO_INTERNO
+  /// 8 - Nacional, com Conteúdo de Importação superior a 70%
+  NACIONAL_CI_SUPERIOR_70
+}
+
+enum ProductUnit {
+  UN
+  KG
+  G
+  L
+  ML
+  M
+  M2
+  M3
+  CX
+  PCT
+  PAR
+  DZ
+  SC
+  HR
+  SRV
+  FD
+  LT
+  BS
+  UNID
+}
+
+enum StockCostMethod {
+  MEDIA_MOVIMENTACAO
+  PEPS
+  UEPS
+  ULTIMO_CUSTO
+  NENHUM
+}
+
+enum StockNegativeBehavior {
+  /// Bloqueia a venda quando o saldo é insuficiente.
+  BLOQUEAR
+  /// Permite saldo negativo.
+  PERMITIR_NEGATIVO
+  /// Permite e gera notificação.
+  ALERTAR
+}
+
+// ============================================================================
+// ENUMS — Estoque
+// ============================================================================
+
+enum StockMovementType {
+  ENTRADA
+  SAIDA
+  TRANSFERENCIA_SAIDA
+  TRANSFERENCIA_ENTRADA
+  AJUSTE_AUMENTO
+  AJUSTE_DIMINUICAO
+  INVENTARIO_AUMENTO
+  INVENTARIO_DIMINUICAO
+  DEVOLUCAO_CLIENTE
+  DEVOLUCAO_FORNECEDOR
+  PERDA
+  AVARIA
+  CANCELAMENTO
+  PRODUCAO
+  CONSUMO
+}
+
+enum StockMovementOrigin {
+  VENDA
+  COMPRA
+  DEVOLUCAO_VENDA
+  DEVOLUCAO_COMPRA
+  AJUSTE_MANUAL
+  INVENTARIO
+  TRANSFERENCIA
+  PERDA
+  AVARIA
+  CANCELAMENTO
+  PRODUCAO
+  IMPORTACAO_XML
+  OUTRO
+}
+
+enum InventoryStatus {
+  RASCUNHO
+  EM_COURSO
+  CONCLUIDO
+  CANCELADO
+}
+
+enum InventoryType {
+  GERAL
+  CICLICO
+  POR_CATEGORIA
+  POR_LOCAL
+  CONTAGEM_CEGA
+}
+
+enum TransferStatus {
+  RASCUNHO
+  EM_TRANSITO
+  RECEBIDO
+  CANCELADO
+}
+
+// ============================================================================
+// ENUMS — Vendas, orçamentos, pedidos e PDV
+// ============================================================================
+
+enum SaleType {
+  BALCAO
+  NORMAL
+  PDV
+  CREDITO
+  REMESSA
+  OUTRA
+}
+
+enum SaleStatus {
+  RASCUNHO
+  PENDENTE
+  CONFIRMADA
+  CONCLUIDA
+  ENTREGUE
+  CANCELADA
+  DEVOLVIDA
+  PARCIALMENTE_DEVOLVIDA
+}
+
+enum SaleChannel {
+  PDV
+  BALCAO
+  LOJA_ONLINE
+  APP
+  TELEFONE
+  WHATSAPP
+  API
+  IMPORTACAO
+}
+
+enum QuoteStatus {
+  RASCUNHO
+  ENVIADO
+  ACEITO
+  RECUSADO
+  EXPIRADO
+  CONVERTIDO
+  CANCELADO
+}
+
+enum OrderStatus {
+  RASCUNHO
+  PENDENTE
+  CONFIRMADO
+  EM_SEPARACAO
+  PRONTO_PARA_ENTREGA
+  ENTREGUE
+  CANCELADO
+}
+
+enum OrderType {
+  PEDIDO
+  REMESSA
+}
+
+enum PaymentMethodType {
+  DINHEIRO
+  PIX
+  CARTAO_DEBITO
+  CARTAO_CREDITO
+  BOLETO
+  TRANSFERENCIA
+  CHEQUE
+  CREDITO_PROPRIO
+  OUTRO
+}
+
+enum PaymentTransactionType {
+  APROVADA
+  RECUSADA
+  PENDENTE
+  CANCELADA
+  ESTORNADA
+}
+
+enum ReturnType {
+  TOTAL
+  PARCIAL
+}
+
+enum PaymentTermsType {
+  A_VISTA
+  DIAS
+  DIAS_RECEBIMENTO
+  DIA_FIXO
+  PARCELADO
+  CUSTOM
+}
+
+// ============================================================================
+// ENUMS — Financeiro
+// ============================================================================
+
+enum AccountType {
+  RECEITA
+  DESPESA
+  CUSTO
+  TRIBUTO
+  ATIVO
+  PASSIVO
+  PATRIMONIO
+  CONTABILIZADOR
+}
+
+enum AccountNature {
+  DEVEDOR
+  CREDOR
+}
+
+enum FinancialEntryType {
+  ENTRADA
+  SAIDA
+  TRANSFERENCIA
+  AJUSTE
+  ESTORNO
+  CONCILIACAO
+}
+
+enum FinancialEntryStatus {
+  PENDENTE
+  PAGO
+  PARCIAL
+  CANCELADO
+  CONCILIADO
+  ESTORNADO
+}
+
+enum PayableReceivableKind {
+  CONTAS_A_RECEBER
+  CONTAS_A_PAGAR
+  CARTAO_DE_CREDITO
+  FOLHA_PAGAMENTO
+  IMPOSTOS
+  PARCELAS_CARTAO
+  OUTRO
+}
+
+enum InstallmentStatus {
+  PENDENTE
+  PAGO
+  PARCIAL
+  VENCIDO
+  CANCELADO
+  ESTORNADO
+}
+
+enum SettlementAction {
+  BAIXA
+  BAIXA_PARCIAL
+  ESTORNO
+  JUROS
+  MULTA
+  DESCONTO
+  RENEGOCIACAO
+  COMPENSACAO
+}
+
+enum BankAccountType {
+  CONTA_CORRENTE
+  POUPANCA
+  CARTEIRA_DIGITAL
+  CONTA_PAGAMENTO
+  OUTRO
+}
+
+enum CashRegisterStatus {
+  ABERTO
+  FECHADO
+}
+
+enum CashMovementType {
+  ENTRADA
+  SAIDA
+  TRANSFERENCIA_ENTRADA
+  TRANSFERENCIA_SAIDA
+  AJUSTE
+  ESTORNO
+}
+
+/// Sentido do movimento de caixa. `IN` soma no caixa da filial, `OUT` subtrai.
+enum CashMovementDirection {
+  IN
+  OUT
+}
+
+enum CommissionStatus {
+  PENDENTE
+  APROVADA
+  PAGA
+  CANCELADA
+  ESTORNADA
+}
+
+enum CommissionBase {
+  VALOR_LIQUIDO_ITEM
+  VALOR_LIQUIDO_VENDA
+  MARGEM
+  QUANTIDADE
+  VALOR_BRUTO_ITEM
+}
+
+// ============================================================================
+// ENUMS — Fiscal (NF-e / NFC-e / NFS-e)
+// ============================================================================
+
+enum InvoiceModel {
+  NF_E
+  NF_CE
+  NFS_E
+}
+
+/// Ambiente do provedor fiscal. O mesmo provedor costuma expor dois.
+enum FiscalEnvironment {
+  HOMOLOGACAO
+  PRODUCAO
+}
+
+/// Status do documento fiscal. Derivado do retorno do PROVEDOR/ÓRGÃO, nunca
+/// do simples HTTP 200. `PROCESSANDO` significa que a SEFAZ ainda não
+/// respondeu — nesse estado o documento NÃO é considerado autorizado.
+enum FiscalStatus {
+  RASCUNHO
+  PROCESSANDO
+  AUTORIZADA
+  REJEITADA
+  CANCELADA
+  DENEGADA
+  CONTINGENCIA
+  SUBSTITUIDA
+  ERRO
+}
+
+enum FiscalJobType {
+  EMITIR_NF_E
+  EMITIR_NF_CE
+  EMITIR_NFS_E
+  CONSULTAR
+  CANCELAR
+  INUTILIZAR
+  CARTA_CORRECAO
+  BAIXAR_XML
+  BAIXAR_DANFE
+  ENVIAR_EMAIL
+  REGISTRAR_DEVOLUCAO
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum FiscalEventType {
+  EMITIR
+  CONSULTAR
+  CANCELAR
+  INUTILIZAR
+  CARTA_CORRECAO
+  BAIXAR_XML
+  BAIXAR_DANFE
+  ENVIAR_EMAIL
+  REGISTRAR_DEVOLUCAO
+  WEBHOOK
+}
+
+enum FiscalLogDirection {
+  OUTBOUND
+  INBOUND
+}
+
+/// Documentos fiscais de entrada: NFe (modelo 55), NFCe (65), CT-e (57).
+enum DocumentType {
+  NF_E
+  NF_CE
+  NFS_E
+  CT_E
+  CUPOM_FISCAL
+  RECIBO
+  DECLARACAO
+  OUTRO
+}
+
+enum ServiceIncentiveType {
+  INCENTIVADO
+  NAO_INCENTIVADO
+  DESONERADO
+  INDEVIDO
+}
+
+enum CertificateStatus {
+  VALIDO
+  VENCIDO
+  REVOGADO
+  PROXIMO_VENCIMENTO
+  INVALIDO
+}
+
+enum WebhookProcessingStatus {
+  PENDENTE
+  PROCESSADO
+  IGNORADO
+  FALHOU
+}
+
+/// Sentido do documento fiscal: `OUT` = emitido pela empresa (NF-e/NFC-e/
+/// NFS-e de saída), `IN` = recebido de terceiros (nota de compra).
+enum FiscalDirection {
+  OUT
+  IN
+}
+
+// ============================================================================
+// ENUMS — Compras
+// ============================================================================
+
+enum PurchaseType {
+  PEDIDO
+  ENTRADA
+}
+
+enum PurchaseStatus {
+  RASCUNHO
+  ENVIADO
+  CONFIRMADO
+  PARCIALMENTE_RECEBIDO
+  RECEBIDO
+  CANCELADO
+}
+
+// ============================================================================
+// ENUMS — Notificações e operação
+// ============================================================================
+
+enum NotificationType {
+  CONTA_A_VENCER
+  CONTA_VENCIDA
+  CONTA_RECEBIDA
+  ESTOQUE_BAIXO
+  ESTOQUE_ZERADO
+  NOTA_AUTORIZADA
+  NOTA_REJEITADA
+  NOTA_CANCELADA
+  NOTA_DENEGADA
+  ERRO_FISCAL
+  VENDA_FINALIZADA
+  COMISSAO_PENDENTE
+  ASSINATURA_VENCENDO
+  ASSINATURA_BLOQUEADA
+  TICKET_ATUALIZADO
+  SISTEMA
+}
+
+enum NotificationPriority {
+  BAIXA
+  NORMAL
+  ALTA
+  CRITICA
+}
+
+// ============================================================================
+// MODELOS DE PLATAFORMA — sem tenantId (compartilhados por todas as empresas)
+// ============================================================================
+
+/// Catálogo global de permissões. O código referencia `key` (ex.: "sales.create");
+/// nunca o id. Renomear um id não quebra nada.
+model Permission {
+  id           String   @id @default(cuid())
+  key          String   @unique @db.VarChar(80)
+  /// Módulo dono da permissão (usado para agrupar na UI e no menu).
+  module       String   @db.VarChar(40)
+  label        String   @db.VarChar(120)
+  description  String?
+  /// Agrupamento para a tela de configuração de perfis (ex.: "Vendas", "Fiscal").
+  group        String   @db.VarChar(60)
+  /// Ações cobertas: ["create","read","update","delete","approve","cancel","export"].
+  actions      String[]
+  /// Somente o super admin da plataforma pode conceder esta permissão.
+  platformOnly Boolean  @default(false) @map("platform_only")
+
+  roles RolePermission[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([module])
+  @@index([group])
+  @@map("permissions")
+}
+
+/// Perfil. `tenantId = NULL` marca um perfil de SISTEMA (matriz de permissões
+/// padrão). Ao provisionar uma empresa, o perfil de sistema é clonado para a
+/// empresa, permitindo ajuste sem afetar as demais.
+model Role {
+  id          String    @id @default(cuid())
+  tenantId    String?   @map("tenant_id")
+  name        String    @db.VarChar(80)
+  slug        String    @db.VarChar(60)
+  description String?
+  scope       RoleScope @default(TENANT)
+  /// Perfil de sistema: não pode ser apagado nem renomeado.
+  isSystem    Boolean   @default(false) @map("is_system")
+  active      Boolean   @default(true)
+
+  permissions RolePermission[]
+  memberships MembershipRole[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, slug])
+  @@index([tenantId, active])
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// Plano SaaS. PREÇOS E LIMITES VIVEM AQUI — nunca no código do front.
+/// A UI lê este model; o servidor valida os limites antes de cada escrita.
+model Plan {
+  id               String        @id @default(cuid())
+  code             String        @unique @db.VarChar(40)
+  name             String        @db.VarChar(80)
+  description      String
+  /// Preço em centavos. 0 = gratuito / sob consulta.
+  priceCents       Int           @default(0) @map("price_cents")
+  /// Preço do ciclo anual cheio. 0 = `priceCents * 12`.
+  annualPriceCents Int           @default(0) @map("annual_price_cents")
+  currency         String        @default("BRL") @db.Char(3)
+  billingPeriod    BillingPeriod @default(MENSAL)
+  /// Duração do trial. Configurável pelo super admin — NUNCA fixo no código.
+  trialDays        Int           @default(0) @map("trial_days")
+
+  // Limites. 0 = ilimitado.
+  maxUsers            Int @default(0) @map("max_users")
+  maxProducts         Int @default(0) @map("max_products")
+  maxCustomers        Int @default(0) @map("max_customers")
+  maxSuppliers        Int @default(0) @map("max_suppliers")
+  maxBranches         Int @default(0) @map("max_branches")
+  maxInvoicesPerMonth Int @default(0) @map("max_invoices_per_month")
+  maxSalesPerMonth    Int @default(0) @map("max_sales_per_month")
+  maxStorageMb        Int @default(0) @map("max_storage_mb")
+
+  features  String[]
+  sortOrder Int      @default(0) @map("sort_order")
+  highlight Boolean  @default(false)
+  active    Boolean  @default(true)
+
+  modules       PlanModule[]
+  tenants       Tenant[]
+  subscriptions Subscription[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([active, sortOrder])
+  @@map("plans")
+}
+
+model PlanModule {
+  planId String        @map("plan_id")
+  module PlanModuleKey
+
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@id([planId, module])
+  @@map("plan_modules")
+}
+
+/// Conta SaaS de uma empresa. É o `tenantId` presente em todos os models de
+/// negócio. NÃO é a empresa legal: essa é `Company`.
+model Tenant {
+  id               String           @id @default(cuid())
+  /// Slug global único, base para subdomínio: {slug}.{dominio}
+  slug             String           @unique @db.VarChar(60)
+  name             String           @db.VarChar(120)
+  status           TenantStatus     @default(PENDENTE)
+  /// Passo do onboarding atual (0 = não iniciado). Ver `src/modules/onboarding`.
+  onboardingStep   Int              @default(0) @map("onboarding_step")
+  welcomeTourState WelcomeTourState @default(NAO_INICIADO) @map("welcome_tour_state")
+
+  planId String @map("plan_id")
+  plan   Plan   @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  /// Espelho do status da assinatura, para consulta rápida no proxy/layout.
+  subscriptionStatus  SubscriptionStatus @default(TRIAL) @map("subscription_status")
+  trialEndsAt         DateTime?          @map("trial_ends_at")
+  currentPeriodEnd    DateTime?          @map("current_period_end")
+  /// Bloqueio por assinatura. O dado é preservado; apenas o acesso é limitado.
+  blockedAt           DateTime?          @map("blocked_at")
+  blockedReason       String?            @map("blocked_reason")
+  /// Acesso somente-leitura quando bloqueado.
+  readOnlyWhenBlocked Boolean            @default(true) @map("read_only_when_blocked")
+
+  logoUrl      String? @map("logo_url")
+  primaryColor String? @map("primary_color")
+  timezone     String  @default("America/Sao_Paulo") @db.VarChar(60)
+  locale       String  @default("pt-BR") @db.VarChar(10)
+  currency     String  @default("BRL") @db.Char(3)
+  settings     Json    @default("{}")
+  metadata     Json    @default("{}")
+
+  /// Espelho 1:1 da assinatura corrente, para leitura rápida no layout e no
+  /// proxy sem JOIN. A verdade continua sendo `Subscription`.
+  subscription    Subscription?    @relation("TenantCurrentSubscription")
+  companies       Company[]
+  branches        Branch[]
+  memberships     Membership[]
+  sessions        Session[]
+  billingInvoices BillingInvoice[]
+  usage           TenantUsage[]
+  tickets         SupportTicket[]
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+
+  tenantSettings TenantSetting[]
+
+  // Cadastros
+  categories     Category[]
+  brands         Brand[]
+  units          Unit[]
+  products       Product[]
+  services       Service[]
+  customers      Customer[]
+  suppliers      Supplier[]
+  returnReasons  ReturnReason[]
+  paymentMethods PaymentMethod[]
+  paymentTerms   PaymentTerms[]
+
+  // Estoque
+  stockItems      StockItem[]
+  stockMovements  StockMovement[]
+  stockTransfers  StockTransfer[]
+  inventories     Inventory[]
+  numberSequences NumberSequence[]
+
+  // Vendas
+  quotes              Quote[]
+  salesOrders         SalesOrder[]
+  sales               Sale[]
+  paymentTransactions PaymentTransaction[]
+  saleReturns         SaleReturn[]
+
+  // Compras
+  purchases Purchase[]
+
+  // Financeiro
+  chartOfAccounts     ChartOfAccount[]
+  costCenters         CostCenter[]
+  bankAccounts        BankAccount[]
+  bankReconciliations BankReconciliation[]
+  cashRegisters       CashRegister[]
+  cashMovements       CashMovement[]
+  financialEntries    FinancialEntry[]
+  settlements         Settlement[]
+  accountsReceivable  AccountsReceivable[]
+  accountsPayable     AccountsPayable[]
+  installments        Installment[]
+
+  // Comissões
+  commissionRules CommissionRule[]
+  commissions     Commission[]
+
+  // Fiscal
+  fiscalIntegrations FiscalIntegration[]
+  fiscalConfigs      FiscalConfig[]
+  fiscalSeries       FiscalSeries[]
+  taxRules           TaxRule[]
+  certificates       Certificate[]
+  invoices           Invoice[]
+  fiscalLogs         FiscalLog[]
+  fiscalJobs         FiscalJob[]
+
+  // --- Filhas com tenant proprio (ver ADR 0002) ---
+  subscriptionEvents      SubscriptionEvent[]
+  stockTransferItems      StockTransferItem[]
+  inventoryItems          InventoryItem[]
+  quoteItems              QuoteItem[]
+  salesOrderItems         SalesOrderItem[]
+  saleItems               SaleItem[]
+  saleReturnItems         SaleReturnItem[]
+  commissionItems         CommissionItem[]
+  bankReconciliationItems BankReconciliationItem[]
+  purchaseItems           PurchaseItem[]
+  invoiceItems            InvoiceItem[]
+  invoiceEvents           InvoiceEvent[]
+  consentLogs             ConsentLog[]
+  dataSubjectRequests     DataSubjectRequest[]
+  supportMessages         SupportMessage[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([status])
+  @@index([planId])
+  @@index([subscriptionStatus])
+  @@index([currentPeriodEnd])
+  @@map("tenants")
+}
+
+/// Assinatura corrente. Uma por tenant (`tenantId` unique).
+/// NUNCA armazenamos dados de cartão. Se houver gateway, guardamos apenas o
+/// identificador do cliente e da assinatura no PSP.
+model Subscription {
+  id       String             @id @default(cuid())
+  tenantId String             @unique @map("tenant_id")
+  planId   String             @map("plan_id")
+  status   SubscriptionStatus @default(TRIAL)
+
+  startedAt          DateTime  @default(now()) @map("started_at")
+  trialEndsAt        DateTime? @map("trial_ends_at")
+  currentPeriodStart DateTime  @default(now()) @map("current_period_start")
+  currentPeriodEnd   DateTime  @map("current_period_end")
+  cancelledAt        DateTime? @map("cancelled_at")
+  cancelAtPeriodEnd  Boolean   @default(false) @map("cancel_at_period_end")
+  cancelReason       String?   @map("cancel_reason")
+
+  /// Preço congelado na contratação. Alterar o plano não reescreve o histórico.
+  priceCents    Int           @default(0) @map("price_cents")
+  currency      String        @default("BRL") @db.Char(3)
+  billingPeriod BillingPeriod @default(MENSAL)
+
+  externalCustomerId     String? @map("external_customer_id")
+  externalSubscriptionId String? @unique @map("external_subscription_id")
+
+  tenant   Tenant              @relation("TenantCurrentSubscription", fields: [tenantId], references: [id], onDelete: Cascade)
+  plan     Plan                @relation(fields: [planId], references: [id], onDelete: Restrict)
+  invoices BillingInvoice[]
+  events   SubscriptionEvent[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([status, currentPeriodEnd])
+  @@map("subscriptions")
+}
+
+/// Trilha imutável de mudanças de assinatura (auditoria de cobrança).
+model SubscriptionEvent {
+  id             String @id @default(cuid())
+  subscriptionId String @map("subscription_id")
+  /// Ex.: "created", "upgraded", "payment_failed", "canceled", "renewed".
+  event          String @db.VarChar(60)
+  payload        Json?
+  /// Origem: "platform_admin", "billing_webhook", "system".
+  source         String @db.VarChar(40)
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId, createdAt])
+  @@index([tenantId])
+  @@map("subscription_events")
+}
+
+model BillingInvoice {
+  id              String               @id @default(cuid())
+  tenantId        String               @map("tenant_id")
+  subscriptionId  String?              @map("subscription_id")
+  number          String               @db.VarChar(40)
+  amountCents     Int                  @map("amount_cents")
+  paidAmountCents Int                  @default(0) @map("paid_amount_cents")
+  currency        String               @default("BRL") @db.Char(3)
+  status          BillingInvoiceStatus @default(PENDENTE)
+  dueDate         DateTime             @map("due_date")
+  paidAt          DateTime?            @map("paid_at")
+  periodStart     DateTime?            @map("period_start")
+  periodEnd       DateTime?            @map("period_end")
+  externalId      String?              @unique @map("external_id")
+  receiptUrl      String?              @map("receipt_url")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, dueDate])
+  @@map("billing_invoices")
+}
+
+/// Uso agregado por competência ("YYYY-MM"). Alimenta o painel da plataforma,
+/// o alerta de limite de plano e a cobrança por uso futura.
+model TenantUsage {
+  id             String   @id @default(cuid())
+  tenantId       String   @map("tenant_id")
+  period         String   @db.Char(7)
+  users          Int      @default(0)
+  products       Int      @default(0)
+  customers      Int      @default(0)
+  suppliers      Int      @default(0)
+  branches       Int      @default(0)
+  sales          Int      @default(0)
+  invoicesIssued Int      @default(0) @map("invoices_issued")
+  salesAmount    Decimal  @default(0) @map("sales_amount") @db.Decimal(14, 2)
+  storageBytes   BigInt   @default(0) @map("storage_bytes")
+  computedAt     DateTime @default(now()) @map("computed_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, period])
+  @@index([tenantId, computedAt])
+  @@map("tenant_usage")
+}
+
+/// Catálogo de provedores fiscais suportados. As credenciais ficam em
+/// `FiscalIntegration` (por empresa), nunca aqui.
+model FiscalProvider {
+  id          String   @id @default(cuid())
+  /// Chave usada na configuração da empresa: "focus", "tecnospeed", "nfe_io".
+  key         String   @unique @db.VarChar(40)
+  name        String   @db.VarChar(80)
+  vendor      String?  @db.VarChar(80)
+  description String?
+  /// Documentação oficial do provedor. SEMPRE consultar antes de integrar.
+  docsUrl     String?  @map("docs_url")
+  /// Modelos suportados: ["NF_E","NF_CE","NFS_E"].
+  supports    String[]
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0) @map("sort_order")
+
+  integrations FiscalIntegration[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([active, sortOrder])
+  @@map("fiscal_providers")
+}
+
+/// Tabela NCM de referência (sem tenantId). Mantida atualizada por job ou por
+/// carga manual. `tableVersion` permite conviver com duas vigências.
+model Ncm {
+  /// Código sem ponto: "22011000".
+  code            String  @id @db.VarChar(12)
+  description     String
+  /// Ex.: "2024-A" (Resolução CONAB). Vigência da tabela.
+  tableVersion    String? @map("table_version") @db.VarChar(20)
+  /// Origem default sugerida (0..8). Sugestão apenas — o contador confirma.
+  suggestedOrigin Int?
+  active          Boolean @default(true)
+
+  products Product[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([active])
+  @@map("ncm")
+}
+
+model Municipality {
+  /// Código IBGE de 7 dígitos.
+  ibgeCode            String      @id @map("ibge_code") @db.VarChar(7)
+  name                String      @db.VarChar(120)
+  uf                  BrazilState
+  /// Provedor nacional de NFS-e do município, quando existir.
+  nationalNfeProvider String?     @map("national_nfe_provider") @db.VarChar(60)
+  active              Boolean     @default(true)
+
+  companies Company[]
+  branches  Branch[]
+  services  Service[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([uf, name])
+  @@map("municipalities")
+}
+
+model PlatformSetting {
+  key         String  @id @db.VarChar(80)
+  value       Json
+  description String?
+  /// Lido apenas no servidor; nunca serializado para o cliente.
+  sensitive   Boolean @default(false)
+  updatedById String? @map("updated_by_id")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_settings")
+}
+
+// ============================================================================
+// IDENTIDADE — global. O mesmo login pode acessar várias empresas.
+// ============================================================================
+
+model User {
+  id                 String     @id @default(cuid())
+  /// E-mail normalizado (lowercase, trim). Único na plataforma inteira.
+  email              String     @unique @db.VarChar(180)
+  /// bcrypt (custo = BCRYPT_COST). NUNCA texto puro, nunca reversível.
+  passwordHash       String?    @map("password_hash")
+  name               String     @db.VarChar(140)
+  phone              String?    @db.VarChar(20)
+  avatarUrl          String?    @map("avatar_url")
+  status             UserStatus @default(PENDENTE_ATIVACAO)
+  emailVerifiedAt    DateTime?  @map("email_verified_at")
+  /// Senha provisoria: o usuario tem de troca-la antes de usar o sistema.
+  ///
+  /// Bloqueia TUDO, inclusive a escolha de empresa — a senha redefinida por
+  /// terceiro e o principal vetor de tomada de conta, e deixar a pessoa escolher
+  /// a empresa antes de trocar a senha ja devolve acesso a algum lugar.
+  ///
+  /// Liberado so pela propria troca, que grava o novo hash e desliga o flag na
+  /// mesma operacao. Nao vale para super admin da plataforma.
+  ///
+  /// Quem aplica isto: `decidirAcesso`, em `src/server/auth/policy.ts`. Ver ADR 0003.
+  mustChangePassword Boolean    @default(false) @map("must_change_password")
+
+  lastLoginAt      DateTime? @map("last_login_at")
+  lastLoginIp      String?   @map("last_login_ip")
+  /// Contador de falhas consecutivas. Zera no login bem-sucedido.
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  /// Bloqueio temporário após brute force.
+  lockedUntil      DateTime? @map("locked_until")
+
+  /// Segredo TOTP cifrado em repouso (AES-256-GCM). Só o app decifra.
+  /// O formato é `v1.<sal>.<nonce>.<ciphertext>.<tag>`, com a chave derivada
+  /// de `AUTH_SECRET` por HKDF. Texto puro aqui transformaria o segundo fator
+  /// em decoração: um dump de `users` bastaria para clonar o segundo fator.
+  totpSecretEncrypted String?   @map("totp_secret_encrypted")
+  totpEnabledAt       DateTime? @map("totp_enabled_at")
+
+  /// Códigos de recuperação, como array JSON de SHA-256 em base64url.
+  ///
+  /// Os códigos em texto claro são entregues UMA vez e nunca são gravados.
+  /// SHA-256 basta aqui, e bcrypt não: cada código tem ~50 bits de entropia de
+  /// `randomBytes`, então não há dicionário para ataque offline, e este caminho
+  /// é justamente o de quem já perdeu o acesso e não pode esperar 100 ms por
+  /// tentativa. Array e não model separado porque o conjunto é sempre lido e
+  /// escrito inteiro, nunca consultado por código.
+  totpRecoveryHashes String? @map("totp_recovery_hashes")
+
+  /// Último passo de TOTP aceito, para impedir REPLAY.
+  ///
+  /// Um código vale por 90 s (o passo de 30 s e os vizinhos, para tolerar
+  /// desvio de relógio). Quem vir o código na tela da vítima pode reapresentá-lo
+  /// dentro dessa janela. Gravar o último passo usado e recusar qualquer passo
+  /// `<=` a ele transforma a janela em uso único. `BigInt` e não `Int`: o passo
+  /// é `floor(unix / 30)` e um Int de 32 bits estoura em 2038.
+  totpLastStep BigInt? @map("totp_last_step")
+
+  /// Super admin da PLATAFORMA. NÃO concede acesso a dados de empresa por si
+  /// só: o acesso ainda exige `Membership`. Acessos de super admin a dados de
+  /// tenant são registrados em `AuditLog` com `isImpersonation`.
+  ///
+  /// Lido em um lugar só — `decidirAcesso`, em `src/server/auth/policy.ts` — e
+  /// ali não abre atalho: sem `Membership`, a resposta é NÃO. Ver ADR 0003.
+  isPlatformAdmin Boolean   @default(false) @map("is_platform_admin")
+  platformAdminAt DateTime? @map("platform_admin_at")
+
+  memberships                Membership[]
+  sessions                   Session[]
+  notifications              Notification[]
+  auditLogs                  AuditLog[]
+  passwordResetTokens        PasswordResetToken[]
+  consents                   ConsentLog[]
+  dataSubjectRequests        DataSubjectRequest[]
+  stockMovements             StockMovement[]
+  salesAsSeller              Sale[]               @relation("SaleSeller")
+  salesAsCreator             Sale[]               @relation("SaleCreator")
+  quotesCreated              Quote[]              @relation("QuoteCreator")
+  ordersCreated              SalesOrder[]         @relation("OrderCreator")
+  salesReturnsApproved       SaleReturn[]         @relation("SaleReturnApprover")
+  purchasesCreated           Purchase[]           @relation("PurchaseCreator")
+  invoicesIssued             Invoice[]            @relation("InvoiceIssuer")
+  commissionRules            CommissionRule[]     @relation("CommissionRuleSeller")
+  commissions                CommissionRule[]     @relation("CommissionRuleCreator")
+  commissionsAsSeller        Commission[]         @relation("CommissionSeller")
+  cashRegistersOpened        CashRegister[]       @relation("CashRegisterOpener")
+  cashRegistersClosed        CashRegister[]       @relation("CashRegisterCloser")
+  supportTicketsOpened       SupportTicket[]      @relation("TicketOpener")
+  supportTicketsAssigned     SupportTicket[]      @relation("TicketAssignee")
+  supportMessages            SupportMessage[]     @relation("SupportMessageAuthor")
+  cashMovements              CashMovement[]       @relation("CashMovementCreator")
+  invoiceEvents              InvoiceEvent[]       @relation("InvoiceEventCreator")
+  dataSubjectRequestsHandled DataSubjectRequest[] @relation("DataSubjectHandler")
+  purchasesAsSeller          Purchase[]           @relation("PurchaseSeller")
+
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  lastSeenAt DateTime? @map("last_seen_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  @@index([status])
+  @@index([isPlatformAdmin])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+/// Sessão revogável. O cookie carrega apenas o `id` (opaco) assinado com
+/// AUTH_SECRET; a verdade sobre a sessão está NESTA TABELA. Isso permite:
+/// revogação imediata (bloqueio de assinatura, troca de senha, logout global),
+/// auditoria de IP/user-agent e expiração real.
+model Session {
+  id           String  @id @default(cuid())
+  /// SHA-256 do token do cookie. O token em claro NUNCA é persistido.
+  tokenHash    String  @unique @map("token_hash")
+  userId       String  @map("user_id")
+  membershipId String? @map("membership_id")
+  /// Empresa ativa. NULL = o usuário ainda precisa escolher a empresa.
+  tenantId     String? @map("tenant_id")
+  /// Filial ativa. NULL = todas as filiais liberadas (conforme `UserBranchAccess`).
+  branchId     String? @map("branch_id")
+
+  status        SessionStatus @default(ATIVA)
+  expiresAt     DateTime      @map("expires_at")
+  lastSeenAt    DateTime      @default(now()) @map("last_seen_at")
+  revokedAt     DateTime?     @map("revoked_at")
+  revokedReason String?       @map("revoked_reason")
+  /// Quantidade de "estou vivo" enviados pelo cliente. Alto volume = replay.
+  activityCount Int           @default(0) @map("activity_count")
+
+  ip                      String? @db.VarChar(64)
+  userAgent               String? @map("user_agent")
+  /// "Lembrar acesso": sessão longa.
+  rememberMe              Boolean @default(false) @map("remember_me")
+  /// Identificador de sessão do super admin que abriu a sessão de um tenant.
+  impersonatedBySessionId String? @map("impersonated_by_session_id")
+  impersonationReason     String? @map("impersonation_reason")
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant     Tenant?     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  membership Membership? @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId, status])
+  @@index([expiresAt])
+  @@index([tenantId, status])
+  @@map("sessions")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  /// SHA-256 do token. Uso único.
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ip        String?   @db.VarChar(64)
+  userAgent String?   @map("user_agent")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, expiresAt])
+  @@map("password_reset_tokens")
+}
+
+/// Vínculo usuário ↔ empresa. Um usuário pode ter várias.
+model Membership {
+  id              String    @id @default(cuid())
+  tenantId        String    @map("tenant_id")
+  userId          String    @map("user_id")
+  /// Dono da conta. Único por tenant (garantido em código + índice único parcial).
+  isOwner         Boolean   @default(false) @map("is_owner")
+  active          Boolean   @default(true)
+  hiredAt         DateTime? @map("hired_at")
+  notes           String?
+  /// Saldo de crédito interno do usuário (ex.: vale/crédito do vendedor).
+  internalBalance Decimal   @default(0) @map("internal_balance") @db.Decimal(14, 2)
+
+  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roles        MembershipRole[]
+  branchAccess UserBranchAccess[]
+  sessions     Session[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, userId])
+  @@index([tenantId, active])
+  @@index([userId])
+  @@map("memberships")
+}
+
+model MembershipRole {
+  membershipId String @map("membership_id")
+  roleId       String @map("role_id")
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([membershipId, roleId])
+  @@index([roleId])
+  @@map("membership_roles")
+}
+
+/// Restringe o usuário a determinadas filiais. Sem nenhum registro, o usuário
+/// vê todas as filiais da empresa. Com registros, vê APENAS estas.
+model UserBranchAccess {
+  membershipId String @map("membership_id")
+  branchId     String @map("branch_id")
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  branch     Branch     @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([membershipId, branchId])
+  @@index([branchId])
+  @@map("user_branch_access")
+}
+
+// ============================================================================
+// EMPRESA, FILIAIS E CONFIGURAÇÃO POR EMPRESA
+// ============================================================================
+
+/// Empresa legal (o CNPJ que emite). Uma conta SaaS pode ter mais de uma
+/// empresa legal (emitir em CNPJs distintos), mas começa com uma.
+model Company {
+  id                    String     @id @default(cuid())
+  tenantId              String     @map("tenant_id")
+  /// Só a empresa matriz emite NF-e com o CNPJ principal.
+  isHeadquarters        Boolean    @default(true) @map("is_headquarters")
+  name                  String     @db.VarChar(180)
+  tradeName             String?    @map("trade_name") @db.VarChar(180)
+  cnpj                  String     @db.VarChar(18)
+  cpf                   String?    @db.VarChar(14)
+  stateRegistration     String?    @map("state_registration") @db.VarChar(20)
+  municipalRegistration String?    @map("municipal_registration") @db.VarChar(20)
+  /// CNAE principal e demais, ambos como string de dígitos.
+  cnaeMain              String?    @map("cnae_main") @db.VarChar(10)
+  cnaeAdditional        String[]   @default([]) @map("cnae_additional")
+  legalNature           String?    @map("legal_nature") @db.VarChar(120)
+  taxRegime             TaxRegime?
+  /// Ano em que a empresa optou pelo Simples Nacional. Usado para lembrar a
+  /// emissão do Comunicado Mensal de Resumo de Faturamento quando o anexo exigir.
+  simplesOptionYear     Int?       @map("simples_option_year")
+  socialCapital         Decimal    @default(0) @map("social_capital") @db.Decimal(14, 2)
+
+  zipCode           String?            @map("zip_code") @db.VarChar(8)
+  street            String?            @db.VarChar(150)
+  streetNumber      String?            @map("street_number") @db.VarChar(20)
+  streetComplement  String?            @map("street_complement") @db.VarChar(80)
+  district          String?            @db.VarChar(80)
+  city              String?            @db.VarChar(100)
+  state             BrazilState?
+  countryCode       String             @default("BRASIL") @map("country_code") @db.VarChar(60)
+  ibgeCode          String?            @map("ibge_code") @db.VarChar(7)
+  addressKind       AddressKind?
+  fiscalAddressKind FiscalAddressKind?
+
+  phone          String? @db.VarChar(20)
+  email          String? @db.VarChar(180)
+  website        String? @db.VarChar(180)
+  logoUrl        String? @map("logo_url")
+  colorHex       String? @map("color_hex") @db.VarChar(7)
+  municipalityId String? @map("municipality_id") @db.VarChar(7)
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  municipality Municipality? @relation(fields: [municipalityId], references: [ibgeCode], onDelete: SetNull)
+  branches     Branch[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, cnpj])
+  @@index([tenantId, isHeadquarters])
+  @@index([tenantId, taxRegime])
+  @@map("companies")
+}
+
+/// Filial / matriz. Toda operação (venda, compra, estoque, nota) pertence a
+/// exatamente uma filial — é o eixo obrigatório de consolidação de relatórios.
+model Branch {
+  id                    String  @id @default(cuid())
+  tenantId              String  @map("tenant_id")
+  companyId             String  @map("company_id")
+  name                  String  @db.VarChar(120)
+  code                  String  @db.VarChar(20)
+  isHeadquarters        Boolean @default(false) @map("is_headquarters")
+  cnpj                  String  @db.VarChar(18)
+  nameLegal             String? @map("name_legal") @db.VarChar(180)
+  tradeName             String? @map("trade_name") @db.VarChar(180)
+  stateRegistration     String? @map("state_registration") @db.VarChar(20)
+  municipalRegistration String? @map("municipal_registration") @db.VarChar(20)
+
+  zipCode           String?            @map("zip_code") @db.VarChar(8)
+  street            String?            @db.VarChar(150)
+  streetNumber      String?            @map("street_number") @db.VarChar(20)
+  streetComplement  String?            @map("street_complement") @db.VarChar(80)
+  district          String?            @db.VarChar(80)
+  city              String?            @db.VarChar(100)
+  state             BrazilState?
+  countryCode       String             @default("BRASIL") @map("country_code") @db.VarChar(60)
+  ibgeCode          String?            @map("ibge_code") @db.VarChar(7)
+  addressKind       AddressKind?
+  fiscalAddressKind FiscalAddressKind?
+
+  phone          String?  @db.VarChar(20)
+  email          String?  @db.VarChar(180)
+  managerName    String?  @map("manager_name") @db.VarChar(120)
+  latitude       Decimal? @db.Decimal(12, 8)
+  longitude      Decimal? @db.Decimal(12, 8)
+  active         Boolean  @default(true)
+  municipalityId String?  @map("municipality_id") @db.VarChar(7)
+
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  company          Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  municipality     Municipality?      @relation(fields: [municipalityId], references: [ibgeCode], onDelete: SetNull)
+  userBranchAccess UserBranchAccess[]
+
+  customers          Customer[]
+  suppliers          Supplier[]
+  products           Product[]
+  stockItems         StockItem[]
+  stockMovements     StockMovement[]
+  stockTransfersFrom StockTransfer[]      @relation("TransferOrigin")
+  stockTransfersTo   StockTransfer[]      @relation("TransferDestination")
+  sales              Sale[]
+  quotes             Quote[]
+  salesOrders        SalesOrder[]
+  saleReturns        SaleReturn[]
+  purchases          Purchase[]
+  invoices           Invoice[]
+  fiscalConfigs      FiscalConfig[]
+  fiscalSeries       FiscalSeries[]
+  taxRules           TaxRule[]
+  certificates       Certificate[]
+  numberSequences    NumberSequence[]
+  cashRegisters      CashRegister[]
+  cashMovements      CashMovement[]
+  bankAccounts       BankAccount[]
+  paymentMethods     PaymentMethod[]
+  paymentTerms       PaymentTerms[]
+  financialEntries   FinancialEntry[]
+  accountsReceivable AccountsReceivable[]
+  accountsPayable    AccountsPayable[]
+  chartOfAccounts    ChartOfAccount[]
+  costCenters        CostCenter[]
+  commissionRules    CommissionRule[]
+  commissions        Commission[]
+  services           Service[]
+  inventories        Inventory[]
+  installments       Installment[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@unique([tenantId, cnpj])
+  @@index([tenantId, active])
+  @@index([companyId])
+  @@map("branches")
+}
+
+/// Configuração chave/valor por empresa. Valores default vivem no código
+/// (`src/modules/settings/defaults.ts`); aqui ficam as customizações.
+/// Exemplos: "stock.cost_method", "sale.allow_negative_stock",
+/// "pdv.require_customer_for_amount", "fiscal.default_cfop".
+model TenantSetting {
+  id          String  @id @default(cuid())
+  tenantId    String  @map("tenant_id")
+  key         String  @db.VarChar(100)
+  value       Json
+  description String?
+  updatedById String? @map("updated_by_id")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, key])
+  @@map("tenant_settings")
+}
+
+// ============================================================================
+// CLIENTES E FORNECEDORES
+// ============================================================================
+
+model Customer {
+  id         String     @id @default(cuid())
+  tenantId   String     @map("tenant_id")
+  /// Filial de origem do cadastro. NULL = cadastro global da empresa.
+  branchId   String?    @map("branch_id")
+  personType PersonType
+  name       String     @db.VarChar(180)
+  tradeName  String?    @map("trade_name") @db.VarChar(180)
+
+  /// Documento gravado apenas com dígitos. A formatação é responsabilidade da
+  /// camada de apresentação. O índice único por tenant impede duplicidade.
+  cpf                   String?   @db.VarChar(11)
+  cnpj                  String?   @db.VarChar(14)
+  /// Valor original do XML quando não bate com CPF/CNPJ (divergência a resolver).
+  documentRaw           String?   @map("document_raw") @db.VarChar(20)
+  stateRegistration     String?   @map("state_registration") @db.VarChar(20)
+  municipalRegistration String?   @map("municipal_registration") @db.VarChar(20)
+  birthDate             DateTime? @map("birth_date")
+
+  email              String?   @db.VarChar(180)
+  phone              String?   @db.VarChar(20)
+  whatsapp           String?   @db.VarChar(20)
+  /// Consentimento de marketing/comunicação, com base legal (LGPD art. 7).
+  marketingConsentAt DateTime? @map("marketing_consent_at")
+
+  zipCode           String?            @map("zip_code") @db.VarChar(8)
+  street            String?            @db.VarChar(150)
+  streetNumber      String?            @map("street_number") @db.VarChar(20)
+  streetComplement  String?            @map("street_complement") @db.VarChar(80)
+  district          String?            @db.VarChar(80)
+  city              String?            @db.VarChar(100)
+  state             BrazilState?
+  countryCode       String             @default("BRASIL") @map("country_code") @db.VarChar(60)
+  ibgeCode          String?            @map("ibge_code") @db.VarChar(7)
+  addressKind       AddressKind?
+  fiscalAddressKind FiscalAddressKind?
+
+  creditLimit           Decimal  @default(0) @map("credit_limit") @db.Decimal(14, 2)
+  defaultPaymentTermsId String?  @map("default_payment_terms_id")
+  notes                 String?
+  tags                  String[]
+  active                Boolean  @default(true)
+
+  /// Total denormalizado, recalculado por job. Acelera dashboard, curva ABC e
+  /// ordenação por valor. Fonte da verdade: `Sale` + `SaleItem`.
+  totalPurchased Decimal   @default(0) @map("total_purchased") @db.Decimal(14, 2)
+  /// Saldo devedor (contas a receber em aberto).
+  totalDebt      Decimal   @default(0) @map("total_debt") @db.Decimal(14, 2)
+  purchaseCount  Int       @default(0) @map("purchase_count")
+  lastPurchaseAt DateTime? @map("last_purchase_at")
+
+  tenant              Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch              Branch?       @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  defaultPaymentTerms PaymentTerms? @relation(fields: [defaultPaymentTermsId], references: [id], onDelete: SetNull)
+
+  sales               Sale[]
+  quotes              Quote[]
+  salesOrders         SalesOrder[]
+  saleReturns         SaleReturn[]
+  invoices            Invoice[]
+  accountsReceivable  AccountsReceivable[]
+  consentLogs         ConsentLog[]
+  dataSubjectRequests DataSubjectRequest[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, cpf])
+  @@unique([tenantId, cnpj])
+  @@index([tenantId, name])
+  @@index([tenantId, active, deletedAt])
+  @@index([tenantId, totalDebt])
+  @@index([tenantId, lastPurchaseAt])
+  @@index([branchId])
+  @@map("customers")
+}
+
+model Supplier {
+  id         String     @id @default(cuid())
+  tenantId   String     @map("tenant_id")
+  branchId   String?    @map("branch_id")
+  personType PersonType @default(JURIDICA)
+  name       String     @db.VarChar(180)
+  tradeName  String?    @map("trade_name") @db.VarChar(180)
+
+  cpf                   String? @db.VarChar(11)
+  cnpj                  String? @db.VarChar(14)
+  documentRaw           String? @map("document_raw") @db.VarChar(20)
+  stateRegistration     String? @map("state_registration") @db.VarChar(20)
+  municipalRegistration String? @map("municipal_registration") @db.VarChar(20)
+
+  email       String? @db.VarChar(180)
+  phone       String? @db.VarChar(20)
+  whatsapp    String? @db.VarChar(20)
+  contactName String? @map("contact_name") @db.VarChar(120)
+
+  zipCode           String?            @map("zip_code") @db.VarChar(8)
+  street            String?            @db.VarChar(150)
+  streetNumber      String?            @map("street_number") @db.VarChar(20)
+  streetComplement  String?            @map("street_complement") @db.VarChar(80)
+  district          String?            @db.VarChar(80)
+  city              String?            @db.VarChar(100)
+  state             BrazilState?
+  countryCode       String             @default("BRASIL") @map("country_code") @db.VarChar(60)
+  ibgeCode          String?            @map("ibge_code") @db.VarChar(7)
+  addressKind       AddressKind?
+  fiscalAddressKind FiscalAddressKind?
+
+  bankName      String? @map("bank_name") @db.VarChar(80)
+  bankCode      String? @map("bank_code") @db.VarChar(10)
+  agency        String? @db.VarChar(20)
+  agencyDigit   String? @map("agency_digit") @db.VarChar(4)
+  accountNumber String? @map("account_number") @db.VarChar(30)
+  accountDigit  String? @map("account_digit") @db.VarChar(4)
+  pixKeyType    String? @map("pix_key_type") @db.VarChar(20)
+  pixKey        String? @map("pix_key") @db.VarChar(140)
+
+  notes               String?
+  tags                String[]
+  active              Boolean   @default(true)
+  totalPurchased      Decimal   @default(0) @map("total_purchased") @db.Decimal(14, 2)
+  totalDebt           Decimal   @default(0) @map("total_debt") @db.Decimal(14, 2)
+  purchaseCount       Int       @default(0) @map("purchase_count")
+  lastPurchaseAt      DateTime? @map("last_purchase_at")
+  averageLeadTimeDays Int       @default(0) @map("average_lead_time_days")
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  purchases       Purchase[]
+  invoices        Invoice[]
+  accountsPayable AccountsPayable[]
+  stockMovements  StockMovement[]
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  deletedAt       DateTime?         @map("deleted_at")
+
+  @@unique([tenantId, cpf])
+  @@unique([tenantId, cnpj])
+  @@index([tenantId, name])
+  @@index([tenantId, active, deletedAt])
+  @@index([branchId])
+  @@map("suppliers")
+}
+
+// ============================================================================
+// CATÁLOGO DE PRODUTOS E SERVIÇOS
+// ============================================================================
+
+model Category {
+  id          String  @id @default(cuid())
+  tenantId    String  @map("tenant_id")
+  parentId    String? @map("parent_id")
+  name        String  @db.VarChar(140)
+  code        String? @db.VarChar(40)
+  description String?
+  sortOrder   Int     @default(0) @map("sort_order")
+  active      Boolean @default(true)
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent          Category?        @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children        Category[]       @relation("CategoryTree")
+  products        Product[]
+  services        Service[]
+  inventories     Inventory[]
+  commissionRules CommissionRule[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, name])
+  @@index([tenantId, parentId])
+  @@index([tenantId, active])
+  @@map("categories")
+}
+
+model Brand {
+  id       String  @id @default(cuid())
+  tenantId String  @map("tenant_id")
+  name     String  @db.VarChar(120)
+  code     String? @db.VarChar(40)
+  logoUrl  String? @map("logo_url")
+  active   Boolean @default(true)
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, name])
+  @@index([tenantId, active])
+  @@map("brands")
+}
+
+/// Unidade de medida. O campo `name` guarda o símbolo (kg, un, cx) e
+/// `decimalPlaces` quantas casas o preço unitário aceita.
+model Unit {
+  id            String  @id @default(cuid())
+  tenantId      String  @map("tenant_id")
+  name          String  @db.VarChar(8)
+  description   String? @db.VarChar(80)
+  decimalPlaces Int     @default(2) @map("decimal_places")
+  active        Boolean @default(true)
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products Product[]
+  services Service[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, name])
+  @@index([tenantId, active])
+  @@map("units")
+}
+
+model Product {
+  id         String  @id @default(cuid())
+  tenantId   String  @map("tenant_id")
+  branchId   String? @map("branch_id")
+  categoryId String? @map("category_id")
+  brandId    String? @map("brand_id")
+  unitId     String  @map("unit_id")
+
+  type        ProductType @default(MERCADORIA)
+  /// Código interno (SKU). Único por tenant.
+  sku         String      @db.VarChar(60)
+  /// Código de barras: EAN-13, EAN-8, UPC-A, ITF-14 ou Code-128. Guardamos
+  /// apenas dígitos para não ter variations por tipo de código.
+  barcode     String?     @db.VarChar(20)
+  name        String      @db.VarChar(200)
+  description String?
+  /// Texto de busca interna.
+  searchTerms String[]    @default([]) @map("search_terms")
+
+  unitPrice           Decimal  @default(0) @map("unit_price") @db.Decimal(14, 4)
+  /// Preço de venda com margem aplicada (allows custom price per product).
+  retailPrice         Decimal  @default(0) @map("retail_price") @db.Decimal(14, 4)
+  wholesalePrice      Decimal  @default(0) @map("wholesale_price") @db.Decimal(14, 4)
+  /// Margem de lucro alvo em percentual (ex.: 35.0000 = 35%). Não é alíquota
+  /// fiscal: é política comercial. O preço final nunca é derivado disto
+  /// automaticamente sem revisão humana.
+  targetMarginPercent Decimal? @map("target_margin_percent") @db.Decimal(9, 4)
+
+  costMethod        StockCostMethod @default(MEDIA_MOVIMENTACAO) @map("cost_method")
+  /// Custo médio ponderado atual (mantido por job após cada entrada).
+  averageCost       Decimal         @default(0) @map("average_cost") @db.Decimal(14, 4)
+  lastPurchasePrice Decimal         @default(0) @map("last_purchase_price") @db.Decimal(14, 4)
+  /// Estoque total de todas as filiais. Fonte da verdade: soma de `StockItem`.
+  totalStock        Decimal         @default(0) @map("total_stock") @db.Decimal(14, 4)
+  /// Saldo considerando apenas a filial ativa no contexto.
+  currentStock      Decimal         @default(0) @map("current_stock") @db.Decimal(14, 4)
+
+  minStock              Decimal               @default(0) @map("min_stock") @db.Decimal(14, 4)
+  maxStock              Decimal               @default(0) @map("max_stock") @db.Decimal(14, 4)
+  /// Estoque reservado por vendas ainda não faturadas.
+  reservedStock         Decimal               @default(0) @map("reserved_stock") @db.Decimal(14, 4)
+  allowNegativeStock    Boolean               @default(false) @map("allow_negative_stock")
+  negativeStockBehavior StockNegativeBehavior @default(BLOQUEAR) @map("negative_stock_behavior")
+
+  weightKg Decimal? @map("weight_kg") @db.Decimal(14, 4)
+  lengthM  Decimal? @map("length_m") @db.Decimal(14, 4)
+  widthM   Decimal? @map("width_m") @db.Decimal(14, 4)
+  heightM  Decimal? @map("height_m") @db.Decimal(14, 4)
+
+  // Dados fiscais. Regra: o contador define; o sistema apenas armazena e valida.
+  ncmCode            String?        @map("ncm_code") @db.VarChar(12)
+  cestCode           String?        @map("cest_code") @db.VarChar(10)
+  productOrigin      ProductOrigin?
+  /// Código Tributário do ICMS (CST/CSOSN). Varia por UF e por NCM.
+  icmsTaxCode        String?        @map("icms_tax_code") @db.VarChar(20)
+  /// Percentual de tributação federal (PIS/COFINS/IRPJ/CSLL/INSS) aplicado na
+  /// venda. Não usamos os percentuais de 2024 em diante como "IBPT" porque
+  /// cada produto tem o seu por NCM, CEST e origem.
+  nationalTaxPercent Decimal?       @map("national_tax_percent") @db.Decimal(9, 4)
+  importTaxPercent   Decimal?       @map("import_tax_percent") @db.Decimal(9, 4)
+  /// Margem de Valor Agregado (MVA) da mercadoria, base do cálculo de ICMS ST.
+  icmsStMvaPercent   Decimal?       @map("icms_st_mva_percent") @db.Decimal(9, 4)
+  /// Fractionário para vendas interestaduais (apenas NFe/ECF). 0 = 1 inteiro.
+  icmsStFraction     Int            @default(0) @map("icms_st_fraction")
+
+  trackSerialNumber Boolean @default(false) @map("track_serial_number")
+  trackBatch        Boolean @default(false) @map("track_batch")
+  trackExpiryDate   Boolean @default(false) @map("track_expiry_date")
+  /// Indices de controle interno.
+  isAnalyzed        Boolean @default(false) @map("is_analyzed")
+  salesCount        Int     @default(0) @map("sales_count")
+  totalRevenue      Decimal @default(0) @map("total_revenue") @db.Decimal(14, 2)
+
+  active        Boolean   @default(true)
+  /// Data a partir da qual o produto pode ser vendido. NULL = imediato.
+  availableFrom DateTime? @map("available_from")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch   Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  brand    Brand?    @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  unit     Unit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  ncm      Ncm?      @relation(fields: [ncmCode], references: [code], onDelete: SetNull)
+
+  stockItems         StockItem[]
+  stockMovements     StockMovement[]
+  stockTransferItems StockTransferItem[]
+  inventoryItems     InventoryItem[]
+  quoteItems         QuoteItem[]
+  saleItems          SaleItem[]
+  salesOrderItems    SalesOrderItem[]
+  saleReturnItems    SaleReturnItem[]
+  purchaseItems      PurchaseItem[]
+  invoiceItems       InvoiceItem[]
+  commissionItems    CommissionItem[]
+  commissionRules    CommissionRule[]
+  taxRules           TaxRule[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, sku])
+  @@index([tenantId, name])
+  @@index([tenantId, barcode])
+  @@index([tenantId, categoryId, active])
+  @@index([tenantId, type, active])
+  @@index([tenantId, ncmCode])
+  @@index([tenantId, totalStock])
+  @@index([branchId])
+  @@map("products")
+}
+
+/// Serviços para NFS-e. Separado de `Product` porque a tributação, a
+/// municipalidade e o provoke incidentam Logicamente.
+model Service {
+  id          String  @id @default(cuid())
+  tenantId    String  @map("tenant_id")
+  branchId    String? @map("branch_id")
+  categoryId  String? @map("category_id")
+  unitId      String? @map("unit_id")
+  code        String  @db.VarChar(60)
+  name        String  @db.VarChar(200)
+  description String?
+  unitPrice   Decimal @default(0) @map("unit_price") @db.Decimal(14, 4)
+
+  /// Código de enquadramento da LC 116/03. Specifica municipal.
+  lc116Code      String?               @map("lc116_code") @db.VarChar(20)
+  issRatePercent Decimal?              @map("iss_rate_percent") @db.Decimal(9, 4)
+  issRetained    Boolean               @default(false) @map("iss_retained")
+  incentiveType  ServiceIncentiveType?
+  issExempt      Boolean               @default(false) @map("iss_exempt")
+
+  /// Nacional (PIS/COFINS/IRPJ/CSLL/INSS) do serviço.
+  nationalTaxPercent Decimal? @map("national_tax_percent") @db.Decimal(9, 4)
+  /// Alíquotas IBS/CBS do serviço (Reforma Tributária). Versionadas em
+  /// `TaxRule` quando o anexo exigir tratamento por grupo de serviço.
+  cbsRatePercent     Decimal? @map("cbs_rate_percent") @db.Decimal(9, 4)
+  ibsRatePercent     Decimal? @map("ibs_rate_percent") @db.Decimal(9, 4)
+
+  /// Mapa municipal de tribute, ex.: "financ_...". Varia por município.
+  municipalTaxMap       String?  @map("municipal_tax_map") @db.VarChar(60)
+  /// Tributos federais retidos na fonte: pisRet, cofinsRet, csllRet, irpjRet, inssRet.
+  pisRetainedPercent    Decimal? @map("pis_retained_percent") @db.Decimal(9, 4)
+  cofinsRetainedPercent Decimal? @map("cofins_retained_percent") @db.Decimal(9, 4)
+  csllRetainedPercent   Decimal? @map("csll_retained_percent") @db.Decimal(9, 4)
+  irpjRetainedPercent   Decimal? @map("irpj_retained_percent") @db.Decimal(9, 4)
+  INSSRetainedPercent   Decimal? @map("inss_retained_percent") @db.Decimal(9, 4)
+
+  /// Igual a "municipalityId" do Company: onde o serviço é prestado.
+  municipalityId String?  @map("municipality_id") @db.VarChar(7)
+  estimatedHours Decimal? @map("estimated_hours") @db.Decimal(10, 2)
+  cost           Decimal  @default(0) @db.Decimal(14, 4)
+  active         Boolean  @default(true)
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch?       @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  category     Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  unit         Unit?         @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  municipality Municipality? @relation(fields: [municipalityId], references: [ibgeCode], onDelete: SetNull)
+
+  saleItems       SaleItem[]
+  salesOrderItems SalesOrderItem[]
+  invoiceItems    InvoiceItem[]
+  quotes          QuoteItem[]
+  taxRules        TaxRule[]
+  saleReturnItems SaleReturnItem[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, name])
+  @@index([tenantId, active])
+  @@index([branchId])
+  @@index([municipalityId])
+  @@map("services")
+}
+
+// ============================================================================
+// CONDIÇÕES DE PAGAMENTO E FORMAS DE PAGAMENTO
+// ============================================================================
+
+model PaymentMethod {
+  id                        String            @id @default(cuid())
+  tenantId                  String            @map("tenant_id")
+  branchId                  String?           @map("branch_id")
+  code                      String            @db.VarChar(30)
+  name                      String            @db.VarChar(80)
+  type                      PaymentMethodType
+  /// Bandeiras aceitas por esta forma (para PDV).
+  brands                    String[]
+  /// Requer integração com adquirente/PSP. Se true e sem gateway configurado,
+  /// a operação registra o pagamento como PENDENTE.
+  requiresGateway           Boolean           @default(false) @map("requires_gateway")
+  gatewayKey                String?           @map("gateway_key") @db.VarChar(60)
+  /// Troco é permitido? Só faz sentido para DINHEIRO.
+  allowsChange              Boolean           @default(false) @map("allows_change")
+  /// Exigir CPF/CNPJ do pagador acima deste valor (em centavos).
+  requireDocumentAboveCents Int               @default(0) @map("require_document_above_cents")
+  active                    Boolean           @default(true)
+  sortOrder                 Int               @default(0) @map("sort_order")
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch              Branch?              @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  sales               Sale[]
+  installments        Installment[]
+  financialEntries    FinancialEntry[]
+  cashMovements       CashMovement[]
+  paymentTransactions PaymentTransaction[]
+  saleSettlements     Settlement[]         @relation("SettlementPaymentMethod")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, active])
+  @@index([branchId])
+  @@map("payment_methods")
+}
+
+model PaymentTerms {
+  id                     String           @id @default(cuid())
+  tenantId               String           @map("tenant_id")
+  branchId               String?          @map("branch_id")
+  name                   String           @db.VarChar(100)
+  type                   PaymentTermsType
+  /// Para A_VISTA: 1. Para DIAS: 30. Para PARCELADO: número de parcelas.
+  installmentCount       Int              @default(1) @map("installment_count")
+  /// Dias entre parcelas (PARCELADO).
+  intervalDays           Int              @default(0) @map("interval_days")
+  /// Para DIA_FIXO: dia do mês (1..28 para evitar fim de mês inexistente).
+  fixedDay               Int?             @map("fixed_day")
+  /// Para CUSTOM: descrição livre.
+  customDescription      String?          @map("custom_description") @db.VarChar(180)
+  /// Desconto à vista em centavos.
+  cashDiscountCents      Int              @default(0) @map("cash_discount_cents")
+  /// Juros ao mês em percentual, para parcelamento com juros.
+  interestPercentMonthly Decimal          @default(0) @map("interest_percent_monthly") @db.Decimal(9, 4)
+  active                 Boolean          @default(true)
+
+  tenant             Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch             Branch?              @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  customers          Customer[]
+  sales              Sale[]
+  quotes             Quote[]
+  salesOrders        SalesOrder[]
+  purchases          Purchase[]
+  accountsReceivable AccountsReceivable[]
+  accountsPayable    AccountsPayable[]
+  invoices           Invoice[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, name])
+  @@index([tenantId, active])
+  @@index([branchId])
+  @@map("payment_terms")
+}
+
+// ============================================================================
+// ESTOQUE
+// ============================================================================
+
+/// Saldo de estoque por produto e filial. É a fonte da verdade do saldo.
+/// `quantity` nunca é alterada fora de `StockMovement` (via transação).
+model StockItem {
+  id        String @id @default(cuid())
+  tenantId  String @map("tenant_id")
+  branchId  String @map("branch_id")
+  productId String @map("product_id")
+
+  quantity         Decimal @default(0) @db.Decimal(14, 4)
+  reservedQuantity Decimal @default(0) @map("reserved_quantity") @db.Decimal(14, 4)
+  /// Custo médio do saldo (14,4). Recalculado por job após cada entrada.
+  averageCost      Decimal @default(0) @map("average_cost") @db.Decimal(14, 4)
+  /// Valor total do saldo (quantity * averageCost). Derivado.
+  totalValue       Decimal @default(0) @map("total_value") @db.Decimal(14, 2)
+
+  minStock          Decimal   @default(0) @map("min_stock") @db.Decimal(14, 4)
+  maxStock          Decimal   @default(0) @map("max_stock") @db.Decimal(14, 4)
+  /// Estoque reservado em trânsito (transferência entre filiais não recebida).
+  inTransitQuantity Decimal   @default(0) @map("in_transit_quantity") @db.Decimal(14, 4)
+  lastMovementAt    DateTime? @map("last_movement_at")
+  lastCountedAt     DateTime? @map("last_counted_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, branchId, productId])
+  @@index([tenantId, quantity])
+  @@index([tenantId, branchId, quantity])
+  @@map("stock_items")
+}
+
+model StockMovement {
+  id        String @id @default(cuid())
+  tenantId  String @map("tenant_id")
+  branchId  String @map("branch_id")
+  productId String @map("product_id")
+  /// Ordem cronológica do movimento. Sem lacunas e monotonicamente crescente.
+  sequence  BigInt @default(autoincrement()) @map("sequence")
+
+  type             StockMovementType
+  origin           StockMovementOrigin
+  quantity         Decimal             @db.Decimal(14, 4)
+  /// Positivo para entrada, negativo para saida.
+  unitCost         Decimal             @default(0) @map("unit_cost") @db.Decimal(14, 4)
+  /// Valor total do movimento. Derivado (quantity * unitCost).
+  totalValue       Decimal             @default(0) @map("total_value") @db.Decimal(14, 2)
+  /// Saldo do item imediatamente apos este movimento.
+  balanceAfter     Decimal             @default(0) @map("balance_after") @db.Decimal(14, 4)
+  averageCostAfter Decimal             @default(0) @map("average_cost_after") @db.Decimal(14, 4)
+
+  documentType    String? @map("document_type") @db.VarChar(40)
+  documentId      String? @map("document_id")
+  documentNumber  String? @map("document_number") @db.VarChar(40)
+  /// Fornecedor de origem (compras, devoluções, importações de XML).
+  supplierId      String? @map("supplier_id")
+  /// Transferência que gerou este movimento.
+  transferId      String? @map("transfer_id")
+  /// Item de inventário que originou o ajuste.
+  inventoryItemId String? @unique @map("inventory_item_id")
+  notes           String?
+  /// Idempotencia: impede movimentacao duplicada em retry de request.
+  idempotencyKey  String? @map("idempotency_key") @db.VarChar(120)
+  performedById   String? @map("performed_by_id")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch        Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplier      Supplier?      @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  transfer      StockTransfer? @relation(fields: [transferId], references: [id], onDelete: SetNull)
+  /// Item de inventário que originou este ajuste. 1-1: um movimento de
+  /// inventário pertence a no máximo um item.
+  inventoryItem InventoryItem? @relation("InventoryMovement", fields: [inventoryItemId], references: [id], onDelete: SetNull)
+  performedBy   User?          @relation(fields: [performedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, branchId, productId, createdAt])
+  @@index([tenantId, documentType, documentId])
+  @@index([tenantId, type, createdAt])
+  @@index([productId, createdAt])
+  @@index([supplierId])
+  @@map("stock_movements")
+}
+
+model StockTransfer {
+  id                  String         @id @default(cuid())
+  tenantId            String         @map("tenant_id")
+  originBranchId      String         @map("origin_branch_id")
+  destinationBranchId String         @map("destination_branch_id")
+  number              String         @db.VarChar(40)
+  status              TransferStatus @default(RASCUNHO)
+
+  requestedById String?   @map("requested_by_id")
+  receivedById  String?   @map("received_by_id")
+  sentAt        DateTime? @map("sent_at")
+  receivedAt    DateTime? @map("received_at")
+  notes         String?
+  /// Transportadora / código de rastreio. Ferramenta externa.
+  trackingCode  String?   @map("tracking_code") @db.VarChar(60)
+
+  tenant            Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  originBranch      Branch @relation("TransferOrigin", fields: [originBranchId], references: [id], onDelete: Cascade)
+  destinationBranch Branch @relation("TransferDestination", fields: [destinationBranchId], references: [id], onDelete: Cascade)
+
+  items     StockTransferItem[]
+  movements StockMovement[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status])
+  @@index([tenantId, originBranchId, destinationBranchId])
+  @@map("stock_transfers")
+}
+
+model StockTransferItem {
+  id               String  @id @default(cuid())
+  transferId       String  @map("transfer_id")
+  productId        String  @map("product_id")
+  quantity         Decimal @db.Decimal(14, 4)
+  quantityReceived Decimal @default(0) @map("quantity_received") @db.Decimal(14, 4)
+  unitCost         Decimal @default(0) @map("unit_cost") @db.Decimal(14, 4)
+  totalValue       Decimal @default(0) @map("total_value") @db.Decimal(14, 2)
+  notes            String?
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  product  Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([transferId, productId])
+  @@index([productId])
+  @@index([tenantId])
+  @@map("stock_transfer_items")
+}
+
+model Inventory {
+  id       String          @id @default(cuid())
+  tenantId String          @map("tenant_id")
+  branchId String          @map("branch_id")
+  number   String          @db.VarChar(40)
+  name     String          @db.VarChar(140)
+  type     InventoryType   @default(GERAL)
+  status   InventoryStatus @default(RASCUNHO)
+
+  categoryId    String?   @map("category_id")
+  locationTag   String?   @map("location_tag") @db.VarChar(80)
+  startedAt     DateTime? @map("started_at")
+  finishedAt    DateTime? @map("finished_at")
+  /// Contador de cegueira: se true, o sistema nao mostra o saldo esperado
+  /// durante a contagem.
+  blindCount    Boolean   @default(false) @map("blind_count")
+  notes         String?
+  performedById String?   @map("performed_by_id")
+  approvedById  String?   @map("approved_by_id")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch   Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  items InventoryItem[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status])
+  @@index([tenantId, branchId, type])
+  @@map("inventories")
+}
+
+model InventoryItem {
+  id               String   @id @default(cuid())
+  inventoryId      String   @map("inventory_id")
+  productId        String   @map("product_id")
+  /// Saldo do sistema no momento em que o item foi incluido.
+  expectedQuantity Decimal  @default(0) @map("expected_quantity") @db.Decimal(14, 4)
+  /// Quantidade contada fisicamente.
+  countedQuantity  Decimal? @map("counted_quantity") @db.Decimal(14, 4)
+  /// Diferenca (counted - expected). Derivado, mas mantido para o relatorio.
+  difference       Decimal? @db.Decimal(14, 4)
+  differenceValue  Decimal  @default(0) @map("difference_value") @db.Decimal(14, 2)
+  unitCost         Decimal  @default(0) @map("unit_cost") @db.Decimal(14, 4)
+  notes            String?
+
+  inventory  Inventory      @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+  product    Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  movement   StockMovement? @relation("InventoryMovement")
+  movementId String?        @unique @map("movement_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([inventoryId, productId])
+  @@index([productId])
+  @@index([tenantId])
+  @@map("stock_inventory_items")
+}
+
+/// Sequencia numerica por empresa/filial/tipo. Numeração com `SELECT ... FOR
+/// UPDATE` dentro de transação. Nunca usar `count() + 1`.
+model NumberSequence {
+  id               String  @id @default(cuid())
+  tenantId         String  @map("tenant_id")
+  branchId         String  @map("branch_id")
+  /// Ex.: "SALE", "SALE_ORDER", "PURCHASE", "INVOICE_NFE", "CUSTOMER".
+  model            String  @db.VarChar(40)
+  /// Ano para séries resetáveis. 0 = série contínua.
+  year             Int     @default(0)
+  prefix           String? @db.VarChar(10)
+  /// Series vigente de nota fiscal (0-999) e último número utilizado.
+  lastNumber       Int     @default(0) @map("last_number")
+  /// Salto configurado: 1 (normal) ou 5 (Resolução COTEC).
+  step             Int     @default(1)
+  /// Numeração de série da NF-e (válida 15 a 999).
+  fiscalSeries     Int?    @map("fiscal_series")
+  nextFiscalNumber Int?    @map("next_fiscal_number")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, branchId, model, year])
+  @@index([tenantId, model])
+  @@map("number_sequences")
+}
+
+// ============================================================================
+// ORÇAMENTOS
+// ============================================================================
+
+model Quote {
+  id         String      @id @default(cuid())
+  tenantId   String      @map("tenant_id")
+  branchId   String      @map("branch_id")
+  customerId String?     @map("customer_id")
+  number     String      @db.VarChar(40)
+  status     QuoteStatus @default(RASCUNHO)
+  type       SaleType    @default(NORMAL)
+
+  paymentTermsId String?   @map("payment_terms_id")
+  validUntil     DateTime? @map("valid_until")
+  notes          String?
+  /// Texto livre que o vendedor escreve para o cliente.
+  message        String?
+
+  subtotal       Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  shippingAmount Decimal @default(0) @map("shipping_amount") @db.Decimal(14, 2)
+  taxAmount      Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total          Decimal @default(0) @db.Decimal(14, 2)
+  /// Snapshot de todos os itens em JSON, para congelar o documento enviado.
+  itemsSnapshot  Json?   @map("items_snapshot")
+
+  sentAt        DateTime? @map("sent_at")
+  acceptedAt    DateTime? @map("accepted_at")
+  rejectedAt    DateTime? @map("rejected_at")
+  convertedAt   DateTime? @map("converted_at")
+  /// Venda gerada por este orçamento. 1-1: um orçamento converte uma vez.
+  convertedToId String?   @unique @map("converted_to_id")
+  createdById   String?   @map("created_by_id")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch        @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  customer     Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  paymentTerms PaymentTerms? @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  convertedTo  Sale?         @relation("QuoteConversion", fields: [convertedToId], references: [id], onDelete: SetNull)
+  items        QuoteItem[]
+  createdBy    User?         @relation("QuoteCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, validUntil])
+  @@index([tenantId, customerId])
+  @@index([tenantId, branchId, createdAt])
+  @@map("quotes")
+}
+
+model QuoteItem {
+  id              String  @id @default(cuid())
+  quoteId         String  @map("quote_id")
+  productId       String? @map("product_id")
+  serviceId       String? @map("service_id")
+  description     String  @db.VarChar(255)
+  quantity        Decimal @db.Decimal(14, 4)
+  unitPrice       Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountPercent Decimal @default(0) @map("discount_percent") @db.Decimal(9, 4)
+  discountAmount  Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  /// Percentual total de impostos (ICMS + PIS + COFINS + ISS...) do item.
+  taxPercent      Decimal @default(0) @map("tax_percent") @db.Decimal(9, 4)
+  taxAmount       Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total           Decimal @default(0) @db.Decimal(14, 2)
+  sortOrder       Int     @default(0) @map("sort_order")
+
+  quote   Quote    @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: Restrict)
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId, sortOrder])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([tenantId])
+  @@map("quote_items")
+}
+
+// ============================================================================
+// PEDIDOS DE VENDA
+// ============================================================================
+
+model SalesOrder {
+  id         String      @id @default(cuid())
+  tenantId   String      @map("tenant_id")
+  branchId   String      @map("branch_id")
+  customerId String?     @map("customer_id")
+  number     String      @db.VarChar(40)
+  status     OrderStatus @default(PENDENTE)
+  type       OrderType   @default(PEDIDO)
+  channel    SaleChannel @default(BALCAO)
+
+  paymentTermsId        String?   @map("payment_terms_id")
+  requestedDeliveryDate DateTime? @map("requested_delivery_date")
+  deliveryAddress       String?   @map("delivery_address")
+  notes                 String?
+  /// Referência externa (pedido vindo de marketplace, webhook, ERP legado).
+  externalId            String?   @map("external_id")
+  externalSource        String?   @map("external_source") @db.VarChar(40)
+
+  subtotal       Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  shippingAmount Decimal @default(0) @map("shipping_amount") @db.Decimal(14, 2)
+  taxAmount      Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total          Decimal @default(0) @db.Decimal(14, 2)
+  itemsSnapshot  Json?   @map("items_snapshot")
+
+  confirmedAt    DateTime? @map("confirmed_at")
+  deliveredAt    DateTime? @map("delivered_at")
+  createdById    String?   @map("created_by_id")
+  /// Chave de idempotência para evitar pedido duplicado de webhook.
+  idempotencyKey String?   @map("idempotency_key") @db.VarChar(120)
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  customer     Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  paymentTerms PaymentTerms?    @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  items        SalesOrderItem[]
+  sale         Sale?            @relation("OrderToSale")
+  invoices     Invoice[]
+  createdBy    User?            @relation("OrderCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, requestedDeliveryDate])
+  @@index([tenantId, customerId])
+  @@index([tenantId, branchId, createdAt])
+  @@map("sales_orders")
+}
+
+model SalesOrderItem {
+  id                String  @id @default(cuid())
+  orderId           String  @map("order_id")
+  productId         String? @map("product_id")
+  serviceId         String? @map("service_id")
+  description       String  @db.VarChar(255)
+  quantity          Decimal @db.Decimal(14, 4)
+  unitPrice         Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountAmount    Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  taxPercent        Decimal @default(0) @map("tax_percent") @db.Decimal(9, 4)
+  taxAmount         Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total             Decimal @default(0) @db.Decimal(14, 2)
+  /// Quantidade já convertida em venda faturada.
+  fulfilledQuantity Decimal @default(0) @map("fulfilled_quantity") @db.Decimal(14, 4)
+  sortOrder         Int     @default(0) @map("sort_order")
+  notes             String?
+
+  order   SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product?   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  service Service?   @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, sortOrder])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([tenantId])
+  @@map("sales_order_items")
+}
+
+// ============================================================================
+// VENDAS
+// ============================================================================
+
+model Sale {
+  id         String      @id @default(cuid())
+  tenantId   String      @map("tenant_id")
+  branchId   String      @map("branch_id")
+  customerId String?     @map("customer_id")
+  /// Orçamento que originou a venda. 1-1: só um orçamento por venda.
+  quoteId    String?     @unique @map("quote_id")
+  /// Pedido que originou a venda.
+  orderId    String?     @unique @map("order_id")
+  number     String      @db.VarChar(40)
+  series     String?     @db.VarChar(10)
+  status     SaleStatus  @default(RASCUNHO)
+  type       SaleType    @default(NORMAL)
+  channel    SaleChannel @default(BALCAO)
+
+  paymentTermsId  String? @map("payment_terms_id")
+  paymentMethodId String? @map("payment_method_id")
+  sellerId        String? @map("seller_id")
+
+  /// Categoria do modelo 55 (NF-e). Varia a cada um ou mais de 3 meses.
+  productCategory String? @map("product_category") @db.VarChar(4)
+  purpose         String? @db.VarChar(120)
+
+  subtotal        Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount  Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  shippingAmount  Decimal @default(0) @map("shipping_amount") @db.Decimal(14, 2)
+  /// ICMS, PIS, COFINS, ISS, IBS, CBS e demais tributos da venda.
+  taxAmount       Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  /// Valor dos tributos que incidem na operação (base de cálculo do item).
+  grossTaxAmount  Decimal @default(0) @map("gross_tax_amount") @db.Decimal(14, 2)
+  retentionAmount Decimal @default(0) @map("retention_amount") @db.Decimal(14, 2)
+  /// Total já recebido, somado de `PaymentTransaction` aprovadas.
+  paidAmount      Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+  total           Decimal @default(0) @db.Decimal(14, 2)
+  /// Custo dos produtos vendidos (para margem real). Derivado de StockMovement.
+  costAmount      Decimal @default(0) @map("cost_amount") @db.Decimal(14, 2)
+  /// Lucro bruto: total - tributos - custo.
+  profitAmount    Decimal @default(0) @map("profit_amount") @db.Decimal(14, 2)
+  itemsSnapshot   Json?   @map("items_snapshot")
+
+  soldAt             DateTime? @map("sold_at")
+  deliveredAt        DateTime? @map("delivered_at")
+  cancelledAt        DateTime? @map("cancelled_at")
+  cancellationReason String?   @map("cancellation_reason")
+  notes              String?
+  internalNotes      String?   @map("internal_notes")
+
+  /// Chave de idempotência: impede venda duplicada no retry de request.
+  idempotencyKey String? @map("idempotency_key") @db.VarChar(120)
+  createdById    String? @map("created_by_id")
+  cancelledById  String? @map("cancelled_by_id")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch        Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  customer      Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  paymentTerms  PaymentTerms?  @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  seller        User?          @relation("SaleSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  createdBy     User?          @relation("SaleCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  /// Contraparte 1-1 do `Quote.convertedTo`.
+  quote         Quote?         @relation("QuoteConversion")
+  order         SalesOrder?    @relation("OrderToSale", fields: [orderId], references: [id], onDelete: SetNull)
+
+  items              SaleItem[]
+  payments           PaymentTransaction[]
+  returns            SaleReturn[]
+  invoices           Invoice[]
+  accountsReceivable AccountsReceivable[]
+  commissions        Commission[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, soldAt])
+  @@index([tenantId, customerId, soldAt])
+  @@index([tenantId, sellerId, soldAt])
+  @@index([tenantId, branchId, soldAt])
+  @@map("sales")
+}
+
+model SaleItem {
+  id               String  @id @default(cuid())
+  saleId           String  @map("sale_id")
+  productId        String? @map("product_id")
+  serviceId        String? @map("service_id")
+  description      String  @db.VarChar(255)
+  quantity         Decimal @db.Decimal(14, 4)
+  unitPrice        Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountAmount   Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  /// Percentual total de tributos do item (ICMS + PIS + COFINS + ISS + IBS + CBS).
+  taxPercent       Decimal @default(0) @map("tax_percent") @db.Decimal(9, 4)
+  taxAmount        Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  /// Valor da operação base (para ST). Derivado do contexto fiscal.
+  grossAmount      Decimal @default(0) @map("gross_amount") @db.Decimal(14, 2)
+  total            Decimal @default(0) @db.Decimal(14, 2)
+  /// Custo unitário no momento da venda. Congelado: não muda com o custo atual.
+  unitCost         Decimal @default(0) @map("unit_cost") @db.Decimal(14, 4)
+  costAmount       Decimal @default(0) @map("cost_amount") @db.Decimal(14, 2)
+  /// Quantidade devolvida até o momento.
+  returnedQuantity Decimal @default(0) @map("returned_quantity") @db.Decimal(14, 4)
+  /// Quebras por NCM e total de tributos aproximados, calculados na emissão.
+  ncmCode          String? @map("ncm_code") @db.VarChar(12)
+  cestCode         String? @map("cest_code") @db.VarChar(10)
+  cfop             String? @db.VarChar(8)
+  icmsPercent      Decimal @default(0) @map("icms_percent") @db.Decimal(9, 4)
+  pisPercent       Decimal @default(0) @map("pis_percent") @db.Decimal(9, 4)
+  cofinsPercent    Decimal @default(0) @map("cofins_percent") @db.Decimal(9, 4)
+  issPercent       Decimal @default(0) @map("iss_percent") @db.Decimal(9, 4)
+  ibsPercent       Decimal @default(0) @map("ibs_percent") @db.Decimal(9, 4)
+  cbsPercent       Decimal @default(0) @map("cbs_percent") @db.Decimal(9, 4)
+  sortOrder        Int     @default(0) @map("sort_order")
+
+  sale        Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product     Product?         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  service     Service?         @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  returnItems SaleReturnItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([saleId, sortOrder])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([saleId, productId])
+  @@index([tenantId])
+  @@map("sale_items")
+}
+
+/// Transação de pagamento da venda. Uma venda pode ter varias (parcelas,
+/// misto de cartão/dinheiro). Só `APROVADA` soma em `Sale.paidAmount`.
+model PaymentTransaction {
+  id                String                 @id @default(cuid())
+  tenantId          String                 @map("tenant_id")
+  saleId            String                 @map("sale_id")
+  paymentMethodId   String?                @map("payment_method_id")
+  installmentNumber Int                    @default(1) @map("installment_number")
+  type              PaymentTransactionType @default(PENDENTE)
+  amount            Decimal                @db.Decimal(14, 2)
+  /// Troco devolvido ao cliente (apenas DINHEIRO).
+  changeAmount      Decimal                @default(0) @map("change_amount") @db.Decimal(14, 2)
+  /// Valor pago acima do total (para analysis de diferença).
+  overpaymentAmount Decimal                @default(0) @map("overpayment_amount") @db.Decimal(14, 2)
+
+  /// Identificador da transação no PSP/adquirente. Nunca guardar cartão.
+  gatewayTransactionId String? @unique @map("gateway_transaction_id")
+  gatewayName          String? @map("gateway_name") @db.VarChar(60)
+  cardBrand            String? @map("card_brand") @db.VarChar(30)
+  cardLastFour         String? @map("card_last_four") @db.VarChar(4)
+  authorizationCode    String? @map("authorization_code") @db.VarChar(40)
+  nsu                  String? @db.VarChar(30)
+  acquirerMessage      String? @map("acquirer_message")
+
+  /// Nota fiscal que recebeu este pagamento. NULL enquanto a venda não foi
+  /// faturada (adiantamento do cliente).
+  invoiceId String? @map("invoice_id")
+
+  paidAt        DateTime? @map("paid_at")
+  refundedAt    DateTime? @map("refunded_at")
+  failureReason String?   @map("failure_reason")
+  /// Comprovante: URL, XML ou PDF. Binário fica em storage externo.
+  receiptUrl    String?   @map("receipt_url")
+
+  sale          Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  invoice       Invoice?       @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, type, createdAt])
+  @@index([saleId, type])
+  @@index([tenantId, paidAt])
+  @@map("payment_transactions")
+}
+
+model SaleReturn {
+  id            String     @id @default(cuid())
+  tenantId      String     @map("tenant_id")
+  branchId      String     @map("branch_id")
+  saleId        String     @map("sale_id")
+  customerId    String?    @map("customer_id")
+  number        String     @db.VarChar(40)
+  type          ReturnType @default(PARCIAL)
+  /// Motivo cadastrado (tabela `ReturnReason`), usado no relatório.
+  reasonId      String?    @map("reason_id")
+  /// Texto livre do motivo, quando não há motivo cadastrado.
+  reasonDetails String?    @map("reason_details")
+
+  subtotal               Decimal              @default(0) @db.Decimal(14, 2)
+  discountAmount         Decimal              @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  taxAmount              Decimal              @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total                  Decimal              @default(0) @db.Decimal(14, 2)
+  /// Valor efetivamente devolvido ao cliente.
+  refundedAmount         Decimal              @default(0) @map("refunded_amount") @db.Decimal(14, 2)
+  /// Se a devolução gera nota fiscal de entrada (crédito). Sempre no fiscal.
+  requiresFiscalDocument Boolean              @default(true) @map("requires_fiscal_document")
+  status                 FinancialEntryStatus @default(PENDENTE)
+
+  returnedAt   DateTime? @map("returned_at")
+  approvedById String?   @map("approved_by_id")
+  notes        String?
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  sale         Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  customer     Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  returnReason ReturnReason?    @relation(fields: [reasonId], references: [id], onDelete: SetNull)
+  items        SaleReturnItem[]
+  approvedBy   User?            @relation("SaleReturnApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, saleId])
+  @@index([tenantId, status, returnedAt])
+  @@map("sale_returns")
+}
+
+model SaleReturnItem {
+  id             String  @id @default(cuid())
+  returnId       String  @map("return_id")
+  saleItemId     String  @map("sale_item_id")
+  productId      String? @map("product_id")
+  serviceId      String? @map("service_id")
+  description    String  @db.VarChar(255)
+  quantity       Decimal @db.Decimal(14, 4)
+  unitPrice      Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  taxAmount      Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total          Decimal @default(0) @db.Decimal(14, 2)
+  unitCost       Decimal @default(0) @map("unit_cost") @db.Decimal(14, 4)
+  /// Reentrada em estoque: o item volta como movimento de devolução.
+  restock        Boolean @default(true)
+  cfop           String? @db.VarChar(8)
+  ncmCode        String? @map("ncm_code") @db.VarChar(12)
+
+  return   SaleReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  saleItem SaleItem   @relation(fields: [saleItemId], references: [id], onDelete: Restrict)
+  product  Product?   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  service  Service?   @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([returnId])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([tenantId])
+  @@map("sale_return_items")
+}
+
+/// Motivo de devolução, com vinculo opcional à NVe. A lista segue a
+/// Tabela de Motivos da NF-e quando aplicável.
+model ReturnReason {
+  id                String  @id @default(cuid())
+  tenantId          String  @map("tenant_id")
+  code              String  @db.VarChar(10)
+  name              String  @db.VarChar(120)
+  /// Motivo fiscal correspondente quando a devolução gerar nota de crédito.
+  /// Vazio para motivos internos que não chegam ao fisco.
+  fiscalCode        String? @map("fiscal_code") @db.VarChar(4)
+  /// Devolução restitui o valor ao cliente?
+  refundsValue      Boolean @default(true) @map("refunds_value")
+  /// Devolução gera entrada de estoque?
+  restocksInventory Boolean @default(true) @map("restocks_inventory")
+  active            Boolean @default(true)
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  returns SaleReturn[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, active])
+  @@map("return_reasons")
+}
+
+// ============================================================================
+// COMISSÕES
+// ============================================================================
+
+/// Regra de comissão por produto, categoria ou vendedor. Definida pela
+/// empresa; o cálculo usa apenas o que está gravado aqui.
+model CommissionRule {
+  id              String         @id @default(cuid())
+  tenantId        String         @map("tenant_id")
+  branchId        String?        @map("branch_id")
+  name            String         @db.VarChar(140)
+  description     String?
+  productId       String?        @map("product_id")
+  categoryId      String?        @map("category_id")
+  sellerId        String?        @map("seller_id")
+  base            CommissionBase @default(VALOR_LIQUIDO_ITEM)
+  /// Percentual sobre a base (ex.: 5.0000 = 5%).
+  percent         Decimal        @db.Decimal(9, 4)
+  /// Valor fixo por item vendido, somado ao percentual.
+  fixedAmount     Decimal        @default(0) @map("fixed_amount") @db.Decimal(14, 2)
+  /// Aplicar a partir de X unidades vendidas no mês.
+  minimumQuantity Decimal?       @map("minimum_quantity") @db.Decimal(14, 4)
+  validFrom       DateTime?      @map("valid_from")
+  validTo         DateTime?      @map("valid_to")
+  active          Boolean        @default(true)
+  createdById     String?        @map("created_by_id")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch    Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  product   Product?  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  category  Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  seller    User?     @relation("CommissionRuleSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  createdBy User?     @relation("CommissionRuleCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId, active])
+  @@index([tenantId, sellerId])
+  @@index([tenantId, productId])
+  @@map("commission_rules")
+}
+
+model Commission {
+  id       String           @id @default(cuid())
+  tenantId String           @map("tenant_id")
+  branchId String?          @map("branch_id")
+  saleId   String?          @map("sale_id")
+  sellerId String           @map("seller_id")
+  status   CommissionStatus @default(PENDENTE)
+  period   String           @db.Char(7)
+
+  baseAmount       Decimal @default(0) @map("base_amount") @db.Decimal(14, 2)
+  percent          Decimal @default(0) @db.Decimal(9, 4)
+  commissionAmount Decimal @default(0) @map("commission_amount") @db.Decimal(14, 2)
+  /// Descontos/estornos já aplicados sobre comissões do período.
+  deductionAmount  Decimal @default(0) @map("deduction_amount") @db.Decimal(14, 2)
+  netAmount        Decimal @default(0) @map("net_amount") @db.Decimal(14, 2)
+  paidAmount       Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+
+  dueDate DateTime? @map("due_date")
+  paidAt  DateTime? @map("paid_at")
+  notes   String?
+
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  sale   Sale?            @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  seller User             @relation("CommissionSeller", fields: [sellerId], references: [id], onDelete: Cascade)
+  items  CommissionItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, sellerId, saleId, period])
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, period, status])
+  @@index([sellerId])
+  @@map("commissions")
+}
+
+model CommissionItem {
+  id           String  @id @default(cuid())
+  commissionId String  @map("commission_id")
+  productId    String? @map("product_id")
+  saleItemId   String? @map("sale_item_id")
+  baseAmount   Decimal @default(0) @map("base_amount") @db.Decimal(14, 2)
+  percent      Decimal @default(0) @db.Decimal(9, 4)
+  amount       Decimal @default(0) @db.Decimal(14, 2)
+
+  commission Commission @relation(fields: [commissionId], references: [id], onDelete: Cascade)
+  product    Product?   @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([commissionId])
+  @@index([productId])
+  @@index([tenantId])
+  @@map("commission_items")
+}
+
+// ============================================================================
+// PLANO DE CONTAS E CENTROS DE CUSTO
+// ============================================================================
+
+/// Plano de contas próprio da empresa. Números estruturados (ex.: "1.1.01.001").
+/// O código de uma conta pode ser edited, mas o `type` NÃO: mudar o tipo de
+/// uma conta já movimentada quebra o DRE. Nesse caso, crie outra conta.
+model ChartOfAccount {
+  id                    String        @id @default(cuid())
+  tenantId              String        @map("tenant_id")
+  branchId              String?       @map("branch_id")
+  code                  String        @db.VarChar(20)
+  name                  String        @db.VarChar(180)
+  type                  AccountType
+  nature                AccountNature
+  parentId              String?       @map("parent_id")
+  /// Conta aceita lançamentos diretamente? false = apenas agrupadora.
+  isPostable            Boolean       @default(true) @map("is_postable")
+  /// Conta de resultado (entra no DRE).
+  isProfitAndLoss       Boolean       @default(false) @map("is_profit_and_loss")
+  /// Conta exigida no ECF / sped (ECD, ECF, EFD ICMS/IPI).
+  isSpedAccount         Boolean       @default(false) @map("is_sped_account")
+  /// Código do grupo no SPED. Ex.: "1.01" = group de availability.
+  spedGroupCode         String?       @map("sped_group_code") @db.VarChar(20)
+  /// Compatível com a conta padrão do contador (ex.: conta 1.1.01.001).
+  compatibleAccountCode String?       @map("compatible_account_code") @db.VarChar(20)
+  active                Boolean       @default(true)
+  notes                 String?
+
+  tenant             Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch             Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  parent             ChartOfAccount?  @relation("AccountTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children           ChartOfAccount[] @relation("AccountTree")
+  entries            FinancialEntry[] @relation("SourceAccount")
+  destinationEntries FinancialEntry[] @relation("DestinationAccount")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  deletedAt          DateTime?        @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, type])
+  @@index([tenantId, parentId])
+  @@index([tenantId, isProfitAndLoss])
+  @@map("chart_of_accounts")
+}
+
+model CostCenter {
+  id          String  @id @default(cuid())
+  tenantId    String  @map("tenant_id")
+  branchId    String? @map("branch_id")
+  code        String  @db.VarChar(20)
+  name        String  @db.VarChar(140)
+  description String?
+  active      Boolean @default(true)
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch  Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  entries FinancialEntry[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, active])
+  @@map("cost_centers")
+}
+
+/// Lançamento financeiro (lançamentos de caixa, contas a pagar/receber e
+/// Transferências). Campos derivados: `amount` nunca é recalculado.
+model FinancialEntry {
+  id          String               @id @default(cuid())
+  tenantId    String               @map("tenant_id")
+  branchId    String               @map("branch_id")
+  type        FinancialEntryType
+  status      FinancialEntryStatus @default(PENDENTE)
+  description String               @db.VarChar(255)
+  notes       String?
+
+  /// Conta de origem (débito) e destino (crédito).
+  sourceAccountId      String  @map("source_account_id")
+  destinationAccountId String  @map("destination_account_id")
+  costCenterId         String? @map("cost_center_id")
+  bankAccountId        String? @map("bank_account_id")
+  paymentMethodId      String? @map("payment_method_id")
+
+  amount          Decimal @db.Decimal(14, 2)
+  /// Saldo pendente (amount - paidAmount). Derivado.
+  remainingAmount Decimal @default(0) @map("remaining_amount") @db.Decimal(14, 2)
+  paidAmount      Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+
+  dueDate        DateTime  @map("due_date")
+  settledDate    DateTime? @map("settled_date")
+  /// Data de competência contábil (pode diferir do vencimento).
+  competenceDate DateTime  @map("competence_date")
+
+  /// Documento de origem (nota, venda, compra, folha).
+  documentType        String?                  @map("document_type") @db.VarChar(40)
+  documentId          String?                  @map("document_id")
+  documentNumber      String?                  @map("document_number") @db.VarChar(40)
+  /// Chave de idempotência.
+  idempotencyKey      String?                  @map("idempotency_key") @db.VarChar(120)
+  createdById         String?                  @map("created_by_id")
+  settledById         String?                  @map("settled_by_id")
+  isRecurring         Boolean                  @default(false) @map("is_recurring")
+  recurrenceRule      String?                  @map("recurrence_rule") @db.VarChar(120)
+  reconciliationItems BankReconciliationItem[] @relation("ReconciliationEntry")
+
+  tenant             Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch             Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  sourceAccount      ChartOfAccount @relation("SourceAccount", fields: [sourceAccountId], references: [id], onDelete: Restrict)
+  destinationAccount ChartOfAccount @relation("DestinationAccount", fields: [destinationAccountId], references: [id], onDelete: Restrict)
+  costCenter         CostCenter?    @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  bankAccount        BankAccount?   @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  paymentMethod      PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  settlements        Settlement[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, competenceDate])
+  @@index([tenantId, documentType, documentId])
+  @@index([tenantId, type, dueDate])
+  @@index([sourceAccountId])
+  @@index([destinationAccountId])
+  @@index([costCenterId])
+  @@index([bankAccountId])
+  @@map("financial_entries")
+}
+
+model Settlement {
+  id              String           @id @default(cuid())
+  tenantId        String           @map("tenant_id")
+  entryId         String           @map("entry_id")
+  action          SettlementAction
+  amount          Decimal          @db.Decimal(14, 2)
+  settledAt       DateTime         @default(now()) @map("settled_at")
+  bankAccountId   String?          @map("bank_account_id")
+  paymentMethodId String?          @map("payment_method_id")
+  notes           String?
+  /// Comprovante (PDF, XML ou URL). Nunca dados de cartão.
+  receiptUrl      String?          @map("receipt_url")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  entry         FinancialEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  bankAccount   BankAccount?   @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  paymentMethod PaymentMethod? @relation("SettlementPaymentMethod", fields: [paymentMethodId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([entryId])
+  @@index([tenantId, settledAt])
+  @@index([bankAccountId])
+  @@index([paymentMethodId])
+  @@map("settlements")
+}
+
+model BankAccount {
+  id               String          @id @default(cuid())
+  tenantId         String          @map("tenant_id")
+  branchId         String?         @map("branch_id")
+  /// Conta do plano de contas que representa o caixa/banco.
+  chartOfAccountId String          @map("chart_of_account_id")
+  name             String          @db.VarChar(140)
+  type             BankAccountType @default(CONTA_CORRENTE)
+  bankName         String?         @db.VarChar(120)
+  bankCode         String?         @map("bank_code") @db.VarChar(10)
+  agency           String?         @db.VarChar(20)
+  agencyDigit      String?         @map("agency_digit") @db.VarChar(4)
+  accountNumber    String?         @map("account_number") @db.VarChar(30)
+  accountDigit     String?         @map("account_digit") @db.VarChar(4)
+  openingBalance   Decimal         @default(0) @map("opening_balance") @db.Decimal(14, 2)
+  currentBalance   Decimal         @default(0) @map("current_balance") @db.Decimal(14, 2)
+  isDefault        Boolean         @default(false) @map("is_default")
+  active           Boolean         @default(true)
+  notes            String?
+
+  tenant          Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch          Branch?              @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  entries         FinancialEntry[]
+  settlements     Settlement[]
+  cashMovements   CashMovement[]
+  reconciliations BankReconciliation[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, name])
+  @@index([tenantId, active])
+  @@index([branchId])
+  @@map("bank_accounts")
+}
+
+/// Conciliação bancária. O ERP não conecta ao banco por conta própria; a
+/// importação de extrato é por arquivo (OFX, CSV, XLSX) ou API do banco.
+model BankReconciliation {
+  id             String    @id @default(cuid())
+  tenantId       String    @map("tenant_id")
+  bankAccountId  String    @map("bank_account_id")
+  period         String    @db.Char(7)
+  status         JobStatus @default(PENDING)
+  openingBalance Decimal   @default(0) @map("opening_balance") @db.Decimal(14, 2)
+  closingBalance Decimal   @default(0) @map("closing_balance") @db.Decimal(14, 2)
+  reconciledAt   DateTime? @map("reconciled_at")
+  reconciledById String?   @map("reconciled_by_id")
+  notes          String?
+
+  tenant      Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bankAccount BankAccount              @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  items       BankReconciliationItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([bankAccountId, period])
+  // Indice nao redundante com o `@@unique` acima (que comeca por
+  // bank_account_id). A extensao de tenant filtra por `tenant_id` em TODA
+  // query; sem este indice a listagem de conciliacoes da empresa vira
+  // table scan.
+  @@index([tenantId])
+  @@map("bank_reconciliations")
+}
+
+model BankReconciliationItem {
+  id                    String    @id @default(cuid())
+  reconciliationId      String    @map("reconciliation_id")
+  entryId               String?   @map("entry_id")
+  /// Linha do extrato importado (para rastreabilidade quando divergente).
+  externalTransactionId String?   @map("external_transaction_id")
+  description           String    @db.VarChar(255)
+  amount                Decimal   @db.Decimal(14, 2)
+  transactionDate       DateTime  @map("transaction_date")
+  reconciled            Boolean   @default(false)
+  reconciledAt          DateTime? @map("reconciled_at")
+
+  reconciliation BankReconciliation @relation(fields: [reconciliationId], references: [id], onDelete: Cascade)
+  entry          FinancialEntry?    @relation("ReconciliationEntry", fields: [entryId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([reconciliationId])
+  @@index([entryId])
+  @@index([tenantId])
+  @@map("bank_reconciliation_items")
+}
+
+// ============================================================================
+// CONTAS A RECEBER E A PAGAR
+// ============================================================================
+
+model AccountsReceivable {
+  id             String                @id @default(cuid())
+  tenantId       String                @map("tenant_id")
+  branchId       String                @map("branch_id")
+  customerId     String?               @map("customer_id")
+  saleId         String?               @map("sale_id")
+  paymentTermsId String?               @map("payment_terms_id")
+  number         String                @db.VarChar(40)
+  kind           PayableReceivableKind @default(CONTAS_A_RECEBER)
+  status         FinancialEntryStatus  @default(PENDENTE)
+
+  originAmount    Decimal @map("origin_amount") @db.Decimal(14, 2)
+  interestAmount  Decimal @default(0) @map("interest_amount") @db.Decimal(14, 2)
+  discountAmount  Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  totalAmount     Decimal @map("total_amount") @db.Decimal(14, 2)
+  paidAmount      Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+  remainingAmount Decimal @default(0) @map("remaining_amount") @db.Decimal(14, 2)
+
+  dueDate         DateTime            @map("due_date")
+  competenceDate  DateTime            @map("competence_date")
+  settledDate     DateTime?           @map("settled_date")
+  notes           String?
+  documentType    String?             @map("document_type") @db.VarChar(40)
+  documentId      String?             @map("document_id")
+  documentNumber  String?             @map("document_number") @db.VarChar(40)
+  documentDate    DateTime?           @map("document_date")
+  category        FinancialEntryType? @map("category")
+  notesSettlement String?             @map("notes_settlement")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch        @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  customer     Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  sale         Sale?         @relation(fields: [saleId], references: [id], onDelete: SetNull)
+  paymentTerms PaymentTerms? @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  installments Installment[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, customerId, status])
+  @@index([tenantId, kind, dueDate])
+  @@index([saleId])
+  @@map("accounts_receivable")
+}
+
+model AccountsPayable {
+  id             String                @id @default(cuid())
+  tenantId       String                @map("tenant_id")
+  branchId       String                @map("branch_id")
+  supplierId     String?               @map("supplier_id")
+  purchaseId     String?               @map("purchase_id")
+  paymentTermsId String?               @map("payment_terms_id")
+  number         String                @db.VarChar(40)
+  kind           PayableReceivableKind @default(CONTAS_A_PAGAR)
+  status         FinancialEntryStatus  @default(PENDENTE)
+
+  originAmount    Decimal @map("origin_amount") @db.Decimal(14, 2)
+  interestAmount  Decimal @default(0) @map("interest_amount") @db.Decimal(14, 2)
+  discountAmount  Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  totalAmount     Decimal @map("total_amount") @db.Decimal(14, 2)
+  paidAmount      Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+  remainingAmount Decimal @default(0) @map("remaining_amount") @db.Decimal(14, 2)
+
+  dueDate         DateTime            @map("due_date")
+  competenceDate  DateTime            @map("competence_date")
+  settledDate     DateTime?           @map("settled_date")
+  notes           String?
+  documentType    String?             @map("document_type") @db.VarChar(40)
+  documentId      String?             @map("document_id")
+  documentNumber  String?             @map("document_number") @db.VarChar(40)
+  documentDate    DateTime?           @map("document_date")
+  category        FinancialEntryType? @map("category")
+  notesSettlement String?             @map("notes_settlement")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch        @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  supplier     Supplier?     @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  purchase     Purchase?     @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  paymentTerms PaymentTerms? @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  installments Installment[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, supplierId, status])
+  @@index([tenantId, kind, dueDate])
+  @@index([purchaseId])
+  @@map("accounts_payable")
+}
+
+/// Parcela de contas a receber/pagar. Uma venda parcelada gera N parcelas.
+model Installment {
+  id                   String            @id @default(cuid())
+  tenantId             String            @map("tenant_id")
+  branchId             String?           @map("branch_id")
+  accountsReceivableId String?           @map("accounts_receivable_id")
+  accountsPayableId    String?           @map("accounts_payable_id")
+  paymentMethodId      String?           @map("payment_method_id")
+  number               Int
+  total                Int
+  status               InstallmentStatus @default(PENDENTE)
+
+  amount          Decimal @db.Decimal(14, 2)
+  interestAmount  Decimal @default(0) @map("interest_amount") @db.Decimal(14, 2)
+  paidAmount      Decimal @default(0) @map("paid_amount") @db.Decimal(14, 2)
+  remainingAmount Decimal @default(0) @map("remaining_amount") @db.Decimal(14, 2)
+
+  dueDate           DateTime  @map("due_date")
+  paidAt            DateTime? @map("paid_at")
+  creditCardDueDate DateTime? @map("credit_card_due_date")
+  notes             String?
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch             Branch?             @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  accountsReceivable AccountsReceivable? @relation(fields: [accountsReceivableId], references: [id], onDelete: Cascade)
+  accountsPayable    AccountsPayable?    @relation(fields: [accountsPayableId], references: [id], onDelete: Cascade)
+  paymentMethod      PaymentMethod?      @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, status, dueDate])
+  @@index([accountsReceivableId])
+  @@index([accountsPayableId])
+  @@index([branchId])
+  @@map("installments")
+}
+
+// ============================================================================
+// COMPRAS
+// ============================================================================
+
+model Purchase {
+  id             String         @id @default(cuid())
+  tenantId       String         @map("tenant_id")
+  branchId       String         @map("branch_id")
+  supplierId     String?        @map("supplier_id")
+  number         String         @db.VarChar(40)
+  type           PurchaseType   @default(PEDIDO)
+  status         PurchaseStatus @default(RASCUNHO)
+  paymentTermsId String?        @map("payment_terms_id")
+  sellerId       String?        @map("seller_id")
+
+  /// Chave de acesso do documento fiscal de entrada (NFe/NFCe modelo 55).
+  /// Base do controle de duplicidade: uma mesma chave não entra duas vezes.
+  fiscalAccessKey String?   @map("fiscal_access_key") @db.VarChar(44)
+  /// XML do documento de entrada, para auditoria e reimportação.
+  fiscalXmlUrl    String?   @map("fiscal_xml_url")
+  orderDate       DateTime  @map("order_date")
+  receivedDate    DateTime? @map("received_date")
+
+  subtotal        Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount  Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  shippingAmount  Decimal @default(0) @map("shipping_amount") @db.Decimal(14, 2)
+  taxAmount       Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  retentionAmount Decimal @default(0) @map("retention_amount") @db.Decimal(14, 2)
+  total           Decimal @default(0) @db.Decimal(14, 2)
+  notes           String?
+
+  idempotencyKey String? @map("idempotency_key") @db.VarChar(120)
+  createdById    String? @map("created_by_id")
+
+  tenant          Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch          Branch            @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  supplier        Supplier?         @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  paymentTerms    PaymentTerms?     @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+  seller          User?             @relation("PurchaseSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  createdBy       User?             @relation("PurchaseCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  items           PurchaseItem[]
+  accountsPayable AccountsPayable[]
+  invoices        Invoice[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, number])
+  @@unique([tenantId, fiscalAccessKey])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, orderDate])
+  @@index([tenantId, supplierId, orderDate])
+  @@index([tenantId, branchId, orderDate])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id                   String  @id @default(cuid())
+  purchaseId           String  @map("purchase_id")
+  productId            String? @map("product_id")
+  description          String  @db.VarChar(255)
+  quantity             Decimal @db.Decimal(14, 4)
+  unitPrice            Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountAmount       Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  taxPercent           Decimal @default(0) @map("tax_percent") @db.Decimal(9, 4)
+  taxAmount            Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total                Decimal @default(0) @db.Decimal(14, 2)
+  /// Unidade de compra (caixa com 12) diferente da unidade de venda (unidade).
+  purchaseUnitQuantity Decimal @default(1) @map("purchase_unit_quantity") @db.Decimal(14, 4)
+  /// Valor líquido de tributos que pode ser aproveitado como crédito.
+  creditableTaxAmount  Decimal @default(0) @map("creditable_tax_amount") @db.Decimal(14, 2)
+  /// Percentual do crédito aproveitável pela empresa.
+  creditableTaxPercent Decimal @default(0) @map("creditable_tax_percent") @db.Decimal(9, 4)
+  cfop                 String? @db.VarChar(8)
+  ncmCode              String? @map("ncm_code") @db.VarChar(12)
+  sortOrder            Int     @default(0) @map("sort_order")
+  notes                String?
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseId, sortOrder])
+  @@index([productId])
+  @@index([tenantId])
+  @@map("purchase_items")
+}
+
+// ============================================================================
+// CAIXA
+// ============================================================================
+
+model CashRegister {
+  id               String             @id @default(cuid())
+  tenantId         String             @map("tenant_id")
+  branchId         String             @map("branch_id")
+  name             String             @db.VarChar(120)
+  status           CashRegisterStatus @default(FECHADO)
+  openedAt         DateTime?          @map("opened_at")
+  closedAt         DateTime?          @map("closed_at")
+  openingAmount    Decimal            @default(0) @map("opening_amount") @db.Decimal(14, 2)
+  /// Total apurado no fechamento (soma dos movimentos + abertura).
+  closingAmount    Decimal            @default(0) @map("closing_amount") @db.Decimal(14, 2)
+  /// Diferença apurada: closingAmount - (sistema esperado).
+  differenceAmount Decimal            @default(0) @map("difference_amount") @db.Decimal(14, 2)
+  expectedAmount   Decimal            @default(0) @map("expected_amount") @db.Decimal(14, 2)
+  countedAmount    Decimal            @default(0) @map("counted_amount") @db.Decimal(14, 2)
+  notes            String?
+  openedById       String?            @map("opened_by_id")
+  closedById       String?            @map("closed_by_id")
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch    Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  openedBy  User?          @relation("CashRegisterOpener", fields: [openedById], references: [id], onDelete: SetNull)
+  closedBy  User?          @relation("CashRegisterCloser", fields: [closedById], references: [id], onDelete: SetNull)
+  movements CashMovement[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, branchId, name])
+  @@index([tenantId, status])
+  @@index([branchId])
+  @@map("cash_registers")
+}
+
+model CashMovement {
+  id              String                @id @default(cuid())
+  tenantId        String                @map("tenant_id")
+  branchId        String                @map("branch_id")
+  cashRegisterId  String                @map("cash_register_id")
+  bankAccountId   String?               @map("bank_account_id")
+  paymentMethodId String?               @map("payment_method_id")
+  type            CashMovementType
+  direction       CashMovementDirection
+  amount          Decimal               @db.Decimal(14, 2)
+  description     String                @db.VarChar(255)
+  documentType    String?               @map("document_type") @db.VarChar(40)
+  documentId      String?               @map("document_id")
+  documentNumber  String?               @map("document_number") @db.VarChar(40)
+  notes           String?
+  movedAt         DateTime              @default(now()) @map("moved_at")
+  createdById     String?               @map("created_by_id")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch        Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  cashRegister  CashRegister   @relation(fields: [cashRegisterId], references: [id], onDelete: Cascade)
+  bankAccount   BankAccount?   @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  createdBy     User?          @relation("CashMovementCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, cashRegisterId, movedAt])
+  @@index([tenantId, type, movedAt])
+  @@index([branchId])
+  @@index([bankAccountId])
+  @@index([createdById])
+  @@map("cash_movements")
+}
+
+// ============================================================================
+// FISCAL — NF-e, NFC-e e NFS-e
+//
+// REGRA INEGOCIÁVEL DESTA SEÇÃO
+//
+// Nenhuma regra fiscal é codificada na aplicação. Alíquota, CFOP, CST,
+// código de beneficiário da UF, forma de emissão, tipo de contingência e versão
+// de layout são LIDOS de `FiscalConfig`/`TaxRule` e enviados ao provedor. O
+// provedor é quem valida contra a NT e o schema vigente. A aplicação apenas
+// orquestra, registra e apresenta o que o autorizador respondeu.
+// ============================================================================
+
+/// Integração fiscal de UMA empresa. Credenciais cifradas em repouso por
+/// `src/server/modules/fiscal/crypto.ts` (AES-256-GCM). Nunca em texto puro.
+model FiscalIntegration {
+  id          String            @id @default(cuid())
+  tenantId    String            @map("tenant_id")
+  providerId  String            @map("provider_id")
+  environment FiscalEnvironment @default(HOMOLOGACAO)
+  name        String            @db.VarChar(120)
+  active      Boolean           @default(true)
+  isDefault   Boolean           @default(false) @map("is_default")
+
+  /// Segredos cifrados. Tipos distintos porque nem todo provedor usa todos.
+  clientIdEncrypted     String?   @map("client_id_encrypted")
+  clientSecretEncrypted String?   @map("client_secret_encrypted")
+  accessTokenEncrypted  String?   @map("access_token_encrypted")
+  refreshTokenEncrypted String?   @map("refresh_token_encrypted")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  /// Token do webhook de retorno do autorizador.
+  webhookTokenEncrypted String?   @map("webhook_token_encrypted")
+
+  /// ID do cadastro no provedor (ex.: CNPJ da empresa no provedor).
+  externalId       String?   @map("external_id")
+  lastTestedAt     DateTime? @map("last_testeded_at")
+  lastTestOk       Boolean?  @map("last_test_ok")
+  lastErrorMessage String?   @map("last_error_message")
+
+  tenant   Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  provider FiscalProvider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  configs  FiscalConfig[]
+  logs     FiscalLog[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, providerId, environment])
+  @@index([tenantId, active, isDefault])
+  @@map("fiscal_integrations")
+}
+
+/// Configuração fiscal por filial: série, CFOP padrão, forma de emissão,
+/// contingencia, imprimante, natureza da operação, identificador local.
+model FiscalConfig {
+  id            String            @id @default(cuid())
+  tenantId      String            @map("tenant_id")
+  branchId      String            @map("branch_id")
+  integrationId String            @map("integration_id")
+  model         InvoiceModel
+  environment   FiscalEnvironment @default(HOMOLOGACAO)
+  active        Boolean           @default(true)
+
+  /// Série vigente (NF-e/NFC-e: 1-999; NFS-e: texto livre por município).
+  series                    String? @db.VarChar(10)
+  /// CFOP padrão para saída de mercadoria/serviço.
+  defaultCfopOut            String? @map("default_cfop_out") @db.VarChar(8)
+  defaultCfopIn             String? @map("default_cfop_in") @db.VarChar(8)
+  /// Natureza da operação (ex.: "VENDA DE MERCADORIA ADQUIRIDA DE TERCEIROS").
+  operationNature           String? @map("operation_nature") @db.VarChar(120)
+  /// Indicador de presença (idPres=1..5) quando o cliente é consumidor final.
+  consumerPresenceIndicator Int?    @map("consumer_presence_indicator")
+  /// Código do município de ocorrência do fato gerador (IBGE).
+  municipalityCode          String? @map("municipality_code") @db.VarChar(7)
+  /// Telefone da empresa (obrigatório na NF-e, tagenderPhone).
+  contactPhone              String? @map("contact_phone") @db.VarChar(20)
+  contactEmail              String? @map("contact_email") @db.VarChar(180)
+  contactName               String? @map("contact_name") @db.VarChar(120)
+
+  /// Impressão: DANFE em A4, formatura de segurança, emitente autorizado.
+  danfeFormat       String? @map("danfe_format") @db.VarChar(20)
+  danfeSecurityForm String? @map("danfe_security_form") @db.VarChar(20)
+  danfePrinterName  String? @map("danfe_printer_name") @db.VarChar(120)
+  danfeCopies       Int     @default(1) @map("danfe_copies")
+  /// Enviar XML por e-mail automaticamente após autorização.
+  sendXmlByEmail    Boolean @default(false) @map("send_xml_by_email")
+  /// Usar homologação para todos os testes do próprio cliente.
+  isTestMode        Boolean @default(false) @map("is_test_mode")
+
+  /// Contingência: o tipo de JE que será acionado e se está ativa.
+  contingencyType          String?   @map("contingency_type") @db.VarChar(40)
+  contingencyJustification String?   @map("contingency_justification")
+  contingencyActive        Boolean   @default(false) @map("contingency_active")
+  contingencyActiveAt      DateTime? @map("contingency_active_at")
+  contingencyEndsAt        DateTime? @map("contingency_ends_at")
+
+  /// Idempotência de emissão (evita duplicar em retry).
+  notes String?
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch      Branch            @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  integration FiscalIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  series_     FiscalSeries[]
+  taxRules    TaxRule[]
+  invoices    Invoice[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, branchId, model, environment])
+  @@index([tenantId, active])
+  @@map("fiscal_configs")
+}
+
+/// Série de documento fiscal com controle de numeração e de
+/// inutilização. Uma série é liberada (envio em lote de autorização) antes do
+/// primeiro documento, conforme protocolo do autorizador.
+model FiscalSeries {
+  id                       String            @id @default(cuid())
+  tenantId                 String            @map("tenant_id")
+  branchId                 String            @map("branch_id")
+  fiscalConfigId           String            @map("fiscal_config_id")
+  model                    InvoiceModel
+  series                   String            @db.VarChar(10)
+  environment              FiscalEnvironment @default(PRODUCAO)
+  /// Ultimo numero utilizado nesta série (liberado no autorizador).
+  lastNumber               Int               @default(0) @map("last_number")
+  /// Proximo numero a usar. NUNCA `count()+1`.
+  nextNumber               Int               @default(1) @map("next_number")
+  /// Numeraçãoconventional ou de contingência com salto.
+  isContingency            Boolean           @default(false) @map("is_contingency")
+  /// Autorização de uso da série: data/hora/protocolo/digest.
+  authorizedAt             DateTime?         @map("authorized_at")
+  authorizationProtocol    String?           @map("authorization_protocol") @db.VarChar(60)
+  authorizationDigestValue String?           @map("authorization_digest_value") @db.VarChar(60)
+  /// Faixa authorized pelo autorizador.
+  authorizedFrom           Int?              @map("authorized_from")
+  authorizedTo             Int?              @map("authorized_to")
+  /// Aproximação deNumbers disponíveis.
+  availableFrom            Int?              @map("available_from")
+  availableTo              Int?              @map("available_to")
+  active                   Boolean           @default(true)
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch       @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  fiscalConfig FiscalConfig @relation(fields: [fiscalConfigId], references: [id], onDelete: Cascade)
+  invoices     Invoice[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, branchId, model, series, environment])
+  @@index([tenantId, model, active])
+  @@map("fiscal_series")
+}
+
+/// Certificado digital A1 do emissor. O arquivo `.pfx` NUNCA fica no banco:
+/// só a chave privada cifrada e o caminho no storage. Pkcs12 tem data de
+/// expiração; o job de rotina alerta antes.
+model Certificate {
+  id       String            @id @default(cuid())
+  tenantId String            @map("tenant_id")
+  branchId String?           @map("branch_id")
+  name     String            @db.VarChar(140)
+  type     String            @default("A1") @db.VarChar(4)
+  status   CertificateStatus @default(VALIDO)
+
+  /// Bytes do PKCS#12 cifrados (AES-256-GCM). NULL se o arquivo estiver só no
+  /// storage externo e `storagePath` for a fonte.
+  pfxEncrypted      String? @map("pfx_encrypted")
+  storagePath       String? @map("storage_path")
+  passwordEncrypted String? @map("password_encrypted")
+  /// SHA-256 do arquivo, para detectar troca indevida.
+  checksum          String? @db.VarChar(64)
+
+  subjectName   String?  @map("subject_name") @db.VarChar(200)
+  issuerName    String?  @map("issuer_name") @db.VarChar(200)
+  serialNumber  String?  @map("serial_number") @db.VarChar(80)
+  validFrom     DateTime @map("valid_from")
+  validUntil    DateTime @map("valid_until")
+  /// CPF/CNPJ do titular do certificado, se extraído do arquivo.
+  ownerDocument String?  @map("owner_document") @db.VarChar(18)
+
+  notes String?
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId, status])
+  @@index([tenantId, validUntil])
+  @@index([branchId])
+  @@map("certificates")
+}
+
+/// Regra de tributação versionada por vigência. Carrega ICMS, PIS, COFINS,
+/// ISS, IBS e CBS. Regras de 2026 (Reforma Tributária) coexistem com as de
+/// 2025 porque o período de transição exige as duas no mesmo banco. Nenhuma
+/// alíquota é padrão no código.
+model TaxRule {
+  id             String  @id @default(cuid())
+  tenantId       String  @map("tenant_id")
+  branchId       String? @map("branch_id")
+  fiscalConfigId String? @map("fiscal_config_id")
+  name           String  @db.VarChar(140)
+  description    String?
+
+  /// Escopo da regra.
+  state         BrazilState?
+  ncmCode       String?        @map("ncm_code") @db.VarChar(12)
+  cestCode      String?        @map("cest_code") @db.VarChar(10)
+  productId     String?        @map("product_id")
+  productOrigin ProductOrigin?
+  serviceId     String?        @map("service_id")
+  cfop          String?        @db.VarChar(8)
+  /// Grupo da reforma (ex.: "mercadoria", "serviço" para IBS/CBS).
+  taxGroup      String?        @map("tax_group") @db.VarChar(60)
+
+  /// CST/CSOSN aplicável. Lido do cadastro, nunca deduzido.
+  icmsTaxCode         String?  @map("icms_tax_code") @db.VarChar(20)
+  icmsRatePercent     Decimal? @map("icms_rate_percent") @db.Decimal(9, 4)
+  /// Redução de base do ICMS (ex.: 40% para cesta básica alimentar).
+  icmsRedutionPercent Decimal? @map("icms_reduction_percent") @db.Decimal(9, 4)
+  icmsStRatePercent   Decimal? @map("icms_st_rate_percent") @db.Decimal(9, 4)
+  icmsStMvaPercent    Decimal? @map("icms_st_mva_percent") @db.Decimal(9, 4)
+
+  pisTaxCode        String?  @map("pis_tax_code") @db.VarChar(20)
+  pisRatePercent    Decimal? @map("pis_rate_percent") @db.Decimal(9, 4)
+  cofinsTaxCode     String?  @map("cofins_tax_code") @db.VarChar(20)
+  cofinsRatePercent Decimal? @map("cofins_rate_percent") @db.Decimal(9, 4)
+  ipiRatePercent    Decimal? @map("ipi_rate_percent") @db.Decimal(9, 4)
+  issRatePercent    Decimal? @map("iss_rate_percent") @db.Decimal(9, 4)
+
+  /// Reforma Tributária (LC 214/2025). Vigência controlada por
+  /// `validFrom`/`validTo`, sem alteração de schema.
+  ibsRatePercent          Decimal? @map("ibs_rate_percent") @db.Decimal(9, 4)
+  cbsRatePercent          Decimal? @map("cbs_rate_percent") @db.Decimal(9, 4)
+  importTaxRatePercent    Decimal? @map("import_tax_rate_percent") @db.Decimal(9, 4)
+  selectiveTaxRatePercent Decimal? @map("selective_tax_rate_percent") @db.Decimal(9, 4)
+
+  /// Vigência. `validTo` NULL = vigente.
+  validFrom DateTime  @map("valid_from")
+  validTo   DateTime? @map("valid_to")
+  priority  Int       @default(0)
+  active    Boolean   @default(true)
+  notes     String?
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch       Branch?       @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  fiscalConfig FiscalConfig? @relation(fields: [fiscalConfigId], references: [id], onDelete: Cascade)
+  product      Product?      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  service      Service?      @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId, active])
+  @@index([tenantId, validFrom, validTo])
+  @@index([tenantId, state, ncmCode])
+  @@index([productId])
+  @@index([serviceId])
+  @@map("tax_rules")
+}
+
+/// Nota fiscal emitida (saída) ou recebida (entrada, `direction` IN). Um
+/// único model serve a NF-e, NFC-e e NFS-e: os campos de transporte e
+/// protocolo só existem em NF-e/NFC-e, e os de serviço só em NFS-e.
+model Invoice {
+  id             String  @id @default(cuid())
+  tenantId       String  @map("tenant_id")
+  branchId       String  @map("branch_id")
+  fiscalConfigId String? @map("fiscal_config_id")
+  fiscalSeriesId String? @map("fiscal_series_id")
+
+  /// Documento comercial que originou a nota (venda, pedido, compra).
+  saleId                  String?           @map("sale_id")
+  orderId                 String?           @map("order_id")
+  purchaseId              String?           @map("purchase_id")
+  /// Fornecedor de origem, para notas de ENTRADA (modelo 55 recebida).
+  supplierId              String?           @map("supplier_id")
+  paymentTermsId          String?           @map("payment_terms_id")
+  /// Nota de origem, quando esta é uma nota de entrada, correção ou
+  /// complementar. NULL para emissão própria.
+  referenceInvoiceId      String?           @map("reference_invoice_id")
+  /// Natureza da operação para este documento (ajuste pontual por nota).
+  operationNatureOverride String?           @map("operation_nature_override") @db.VarChar(120)
+  model                   InvoiceModel
+  direction               FiscalDirection   @default(OUT)
+  status                  FiscalStatus      @default(RASCUNHO)
+  environment             FiscalEnvironment @default(HOMOLOGACAO)
+
+  /// Número e série internos. `number` é alocado por `FiscalSeries`.
+  number                Int
+  series                String?   @db.VarChar(10)
+  /// Chave de acesso (44 dígitos) preenchida após autorização.
+  accessKey             String?   @unique @db.VarChar(44)
+  /// Chave de acesso de consulta (chNFe +versão 4.00).
+  queryKey              String?   @map("query_key") @db.VarChar(60)
+  /// Token do recibo do autorizador.
+  receiptToken          String?   @map("receipt_token") @db.VarChar(20)
+  /// Data/hora de autorização e protocolo.
+  authorizedAt          DateTime? @map("authorized_at")
+  authorizationProtocol String?   @map("authorization_protocol") @db.VarChar(60)
+  authorizationDigest   String?   @map("authorization_digest") @db.VarChar(80)
+  /// Protocolo de DENEGA, se aplicável.
+  denialReason          String?   @map("denial_reason")
+  denialProtocol        String?   @map("denial_protocol") @db.VarChar(60)
+
+  /// Dados do destinatário/remetente, congelados no XML.
+  customerId                String?            @map("customer_id")
+  customerName              String             @map("customer_name") @db.VarChar(180)
+  customerDocument          String?            @map("customer_document") @db.VarChar(18)
+  customerDocumentRaw       String?            @map("customer_document_raw") @db.VarChar(20)
+  customerEmail             String?            @map("customer_email") @db.VarChar(180)
+  customerStateRegistration String?            @map("customer_state_registration") @db.VarChar(20)
+  customerAddressKind       FiscalAddressKind?
+  customerCountryCode       String?            @map("customer_country_code") @db.VarChar(60)
+  customerStreet            String?            @map("customer_street") @db.VarChar(150)
+  customerStreetNumber      String?            @map("customer_street_number") @db.VarChar(20)
+  customerStreetComplement  String?            @map("customer_street_complement") @db.VarChar(80)
+  customerDistrict          String?            @map("customer_district") @db.VarChar(80)
+  customerCity              String?            @map("customer_city") @db.VarChar(100)
+  customerState             BrazilState?
+  customerZipCode           String?            @map("customer_zip_code") @db.VarChar(8)
+  customerCountryId         String?            @map("customer_country_id") @db.VarChar(20)
+  customerPhone             String?            @map("customer_phone") @db.VarChar(20)
+
+  /// Totais. Subtotais separados para o cálculo dos tributos Federais.
+  subtotal          Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount    Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  shippingAmount    Decimal @default(0) @map("shipping_amount") @db.Decimal(14, 2)
+  totalProducts     Decimal @default(0) @map("total_products") @db.Decimal(14, 2)
+  totalServices     Decimal @default(0) @map("total_services") @db.Decimal(14, 2)
+  icmsTotal         Decimal @default(0) @map("icms_total") @db.Decimal(14, 2)
+  ipiTotal          Decimal @default(0) @map("ipi_total") @db.Decimal(14, 2)
+  pisTotal          Decimal @default(0) @map("pis_total") @db.Decimal(14, 2)
+  cofinsTotal       Decimal @default(0) @map("cofins_total") @db.Decimal(14, 2)
+  issTotal          Decimal @default(0) @map("iss_total") @db.Decimal(14, 2)
+  ibsTotal          Decimal @default(0) @map("ibs_total") @db.Decimal(14, 2)
+  cbsTotal          Decimal @default(0) @map("cbs_total") @db.Decimal(14, 2)
+  importTaxTotal    Decimal @default(0) @map("import_tax_total") @db.Decimal(14, 2)
+  selectiveTaxTotal Decimal @default(0) @map("selective_tax_total") @db.Decimal(14, 2)
+  /// Total dos tributos (Lei da Transparência, tag vTotTrib).
+  grossTaxTotal     Decimal @default(0) @map("gross_tax_total") @db.Decimal(14, 2)
+  retentionAmount   Decimal @default(0) @map("retention_amount") @db.Decimal(14, 2)
+  total             Decimal @default(0) @db.Decimal(14, 2)
+
+  /// Transporte (NF-e/NFC-e).
+  transporterName   String?      @map("transporter_name") @db.VarChar(120)
+  transportModFrete Int?         @map("transport_mod_frete")
+  vehiclePlate      String?      @map("vehicle_plate") @db.VarChar(10)
+  vehicleUf         BrazilState?
+
+  /// Fatura / dados adicionais.
+  invoiceNumber       String? @map("invoice_number") @db.VarChar(40)
+  purchaseOrderNumber String? @map("purchase_order_number") @db.VarChar(40)
+  contractNumber      String? @map("contract_number") @db.VarChar(40)
+  additionalData      String? @map("additional_data")
+
+  /// XML, DANFE e comprovante ficam no storage; aqui só o caminho e o hash.
+  xmlUrl                    String?   @map("xml_url")
+  xmlHash                   String?   @map("xml_hash") @db.VarChar(64)
+  danfeUrl                  String?   @map("danfe_url")
+  pdfUrl                    String?   @map("pdf_url")
+  cifpPdfUrl                String?   @map("cifp_pdf_url")
+  cancelledAt               DateTime? @map("cancelled_at")
+  cancellationProtocol      String?   @map("cancellation_protocol") @db.VarChar(60)
+  cancellationJustification String?   @map("cancellation_justification") @db.VarChar(255)
+  substitutedById           String?   @map("substituted_by_id")
+  contingencyJE             String?   @map("contingency_je") @db.VarChar(20)
+
+  emittedAt        DateTime? @map("emitted_at")
+  canceledAt       DateTime? @map("canceled_at")
+  notes            String?
+  /// Prazo legal de guarda. Antes de expirar, o job de retenção bloqueia a
+  /// exclusão e sinaliza o operador. Depois, exige `approvedForPurge`.
+  retentionUntil   DateTime? @map("retention_until")
+  approvedForPurge Boolean   @default(false) @map("approved_for_purge")
+
+  /// Chave de idempotência de emissão: o mesmo retry nunca duplica a nota.
+  idempotencyKey String? @map("idempotency_key") @db.VarChar(120)
+  issuedById     String? @map("issued_by_id")
+
+  tenant             Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch             Branch        @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  fiscalConfig       FiscalConfig? @relation(fields: [fiscalConfigId], references: [id], onDelete: SetNull)
+  fiscalSeries       FiscalSeries? @relation(fields: [fiscalSeriesId], references: [id], onDelete: SetNull)
+  sale               Sale?         @relation(fields: [saleId], references: [id], onDelete: SetNull)
+  order              SalesOrder?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  purchase           Purchase?     @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  referenceInvoice   Invoice?      @relation("InvoiceReference", fields: [referenceInvoiceId], references: [id], onDelete: SetNull)
+  referencedInvoices Invoice[]     @relation("InvoiceReference")
+  substitutedBy      Invoice?      @relation("InvoiceSubstitution", fields: [substitutedById], references: [id], onDelete: SetNull)
+  substitutes        Invoice[]     @relation("InvoiceSubstitution")
+  customer           Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  supplier           Supplier?     @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  issuedBy           User?         @relation("InvoiceIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+  paymentTerms       PaymentTerms? @relation(fields: [paymentTermsId], references: [id], onDelete: SetNull)
+
+  items               InvoiceItem[]
+  events              InvoiceEvent[]
+  logs                FiscalLog[]
+  jobs                FiscalJob[]
+  paymentTransactions PaymentTransaction[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, accessKey])
+  @@unique([tenantId, model, series, number, environment, direction])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, emittedAt])
+  @@index([tenantId, direction, emittedAt])
+  @@index([tenantId, customerId, emittedAt])
+  @@index([tenantId, referenceInvoiceId])
+  @@index([tenantId, retentionUntil, approvedForPurge])
+  @@index([branchId, status])
+  @@map("invoices")
+}
+
+/// Item da nota. Guarda o snapshot do produto e TODAS as alíquotas que
+/// foram aplicadas; se o cadastro do produto mudar, a nota permanece fiel.
+model InvoiceItem {
+  id             String  @id @default(cuid())
+  invoiceId      String  @map("invoice_id")
+  productId      String? @map("product_id")
+  serviceId      String? @map("service_id")
+  saleItemId     String? @map("sale_item_id")
+  description    String  @db.VarChar(255)
+  quantity       Decimal @db.Decimal(14, 4)
+  unitPrice      Decimal @map("unit_price") @db.Decimal(14, 4)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(14, 2)
+  /// Subtotal do item antes dos tributos.
+  subtotal       Decimal @default(0) @db.Decimal(14, 2)
+  /// Valor bruto (base do ICMS ST / FCP).
+  grossAmount    Decimal @default(0) @map("gross_amount") @db.Decimal(14, 2)
+  taxAmount      Decimal @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  total          Decimal @default(0) @db.Decimal(14, 2)
+
+  ncmCode         String?        @map("ncm_code") @db.VarChar(12)
+  ncmTableVersion String?        @map("ncm_table_version") @db.VarChar(20)
+  cestCode        String?        @map("cest_code") @db.VarChar(10)
+  productOrigin   ProductOrigin?
+  cfop            String?        @db.VarChar(8)
+  /// Código deaglutinação do item no SPED (tipo de pessoa + item).
+  spedItemType    String?        @map("sped_item_type") @db.VarChar(60)
+
+  icmsTaxCode       String? @map("icms_tax_code") @db.VarChar(20)
+  icmsBase          Decimal @default(0) @map("icms_base") @db.Decimal(14, 2)
+  icmsRatePercent   Decimal @default(0) @map("icms_rate_percent") @db.Decimal(9, 4)
+  icmsAmount        Decimal @default(0) @map("icms_amount") @db.Decimal(14, 2)
+  icmsStAmount      Decimal @default(0) @map("icms_st_amount") @db.Decimal(14, 2)
+  icmsStBase        Decimal @default(0) @map("icms_st_base") @db.Decimal(14, 2)
+  fcpAmount         Decimal @default(0) @map("fcp_amount") @db.Decimal(14, 2)
+  icmsUfRatePercent Decimal @default(0) @map("icms_uf_rate_percent") @db.Decimal(9, 4)
+  icmsUfAmount      Decimal @default(0) @map("icms_uf_amount") @db.Decimal(14, 2)
+
+  pisTaxCode        String? @map("pis_tax_code") @db.VarChar(20)
+  pisBase           Decimal @default(0) @map("pis_base") @db.Decimal(14, 2)
+  pisRatePercent    Decimal @default(0) @map("pis_rate_percent") @db.Decimal(9, 4)
+  pisAmount         Decimal @default(0) @map("pis_amount") @db.Decimal(14, 2)
+  cofinsTaxCode     String? @map("cofins_tax_code") @db.VarChar(20)
+  cofinsBase        Decimal @default(0) @map("cofins_base") @db.Decimal(14, 2)
+  cofinsRatePercent Decimal @default(0) @map("cofins_rate_percent") @db.Decimal(9, 4)
+  cofinsAmount      Decimal @default(0) @map("cofins_amount") @db.Decimal(14, 2)
+  ipiBase           Decimal @default(0) @map("ipi_base") @db.Decimal(14, 2)
+  ipiRatePercent    Decimal @default(0) @map("ipi_rate_percent") @db.Decimal(9, 4)
+  ipiAmount         Decimal @default(0) @map("ipi_amount") @db.Decimal(14, 2)
+  issBase           Decimal @default(0) @map("iss_base") @db.Decimal(14, 2)
+  issRatePercent    Decimal @default(0) @map("iss_rate_percent") @db.Decimal(9, 4)
+  issAmount         Decimal @default(0) @map("iss_amount") @db.Decimal(14, 2)
+
+  ibsBase                 Decimal @default(0) @map("ibs_base") @db.Decimal(14, 2)
+  ibsRatePercent          Decimal @default(0) @map("ibs_rate_percent") @db.Decimal(9, 4)
+  ibsAmount               Decimal @default(0) @map("ibs_amount") @db.Decimal(14, 2)
+  cbsBase                 Decimal @default(0) @map("cbs_base") @db.Decimal(14, 2)
+  cbsRatePercent          Decimal @default(0) @map("cbs_rate_percent") @db.Decimal(9, 4)
+  cbsAmount               Decimal @default(0) @map("cbs_amount") @db.Decimal(14, 2)
+  importTaxBase           Decimal @default(0) @map("import_tax_base") @db.Decimal(14, 2)
+  importTaxRatePercent    Decimal @default(0) @map("import_tax_rate_percent") @db.Decimal(9, 4)
+  importTaxAmount         Decimal @default(0) @map("import_tax_amount") @db.Decimal(14, 2)
+  selectiveTaxBase        Decimal @default(0) @map("selective_tax_base") @db.Decimal(14, 2)
+  selectiveTaxRatePercent Decimal @default(0) @map("selective_tax_rate_percent") @db.Decimal(9, 4)
+  selectiveTaxAmount      Decimal @default(0) @map("selective_tax_amount") @db.Decimal(14, 2)
+
+  /// Tributos FEDERAIS (Lei da Transparência, tag vTotTribNF).
+  federalTaxAmount     Decimal @default(0) @map("federal_tax_amount") @db.Decimal(14, 2)
+  /// Tributos ESTADUAIS (tag vTotTribNF).
+  stateTaxAmount       Decimal @default(0) @map("state_tax_amount") @db.Decimal(14, 2)
+  /// Tributos MUNICIPAIS (tag vTotTribNF).
+  municipalTaxAmount   Decimal @default(0) @map("municipal_tax_amount") @db.Decimal(14, 2)
+  /// Total dos tributos aproximados (tag indTot).
+  approximateTaxAmount Decimal @default(0) @map("approximate_tax_amount") @db.Decimal(14, 2)
+
+  /// Info adicional do item (tag infAdProd): alergênicos, rastreio, VALOR).
+  additionalData String? @map("additional_data")
+  sortOrder      Int     @default(0) @map("sort_order")
+  /// Número do controle da venda (para rastreio interno).
+  traceId        String? @map("trace_id") @db.VarChar(60)
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, sortOrder])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([ncmCode])
+  @@index([tenantId])
+  @@map("invoice_items")
+}
+
+/// Evento do ciclo de vida do documento (emissão, consulta, cancelamento,
+/// carta de correção, download). Um documento tem vários eventos; a trilha
+/// nunca é apagada.
+model InvoiceEvent {
+  id          String          @id @default(cuid())
+  invoiceId   String          @map("invoice_id")
+  type        FiscalEventType
+  status      JobStatus       @default(SUCCESS)
+  message     String?         @db.VarChar(500)
+  payload     Json?
+  /// Protocolo/digest gerados neste evento.
+  protocol    String?         @db.VarChar(60)
+  digest      String?         @db.VarChar(80)
+  /// Código de erro do autorizador (tag cStat).
+  errorCode   String?         @map("error_code") @db.VarChar(20)
+  ip          String?         @db.VarChar(64)
+  createdById String?         @map("created_by_id")
+
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("InvoiceEventCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, createdAt])
+  @@index([type, createdAt])
+  @@index([tenantId])
+  @@map("invoice_events")
+}
+
+/// Trilha HTTP completa da integração fiscal: payload enviado ao provedor e
+/// resposta recebida. Guarda o necessário para suporte e auditoria. Senhas e
+/// tokens NÃO entram no payload: use `headersSanitized`/`bodySanitized`.
+model FiscalLog {
+  id              String             @id @default(cuid())
+  tenantId        String             @map("tenant_id")
+  invoiceId       String?            @map("invoice_id")
+  integrationId   String?            @map("integration_id")
+  direction       FiscalLogDirection
+  /// Endpoint chamado (host + path, sem credenciais).
+  endpoint        String             @db.VarChar(500)
+  httpMethod      String?            @map("http_method") @db.VarChar(10)
+  httpStatus      Int?               @map("http_status")
+  durationMs      Int?               @map("duration_ms")
+  /// Payload ENVIADO, já sanitizado por `sanitizeFiscalPayload`. Formato:
+  /// `{ body, headers, maskedKeys[], originalSize, isBinary }`. Nunca gravar o
+  /// payload cru: conteria token, client_secret e XML com dados do emitente.
+  requestPayload  Json?              @map("request_payload")
+  /// Payload RECEBIDO, mesmo formato e mesma sanitização.
+  responsePayload Json?              @map("response_payload")
+  /// Chaves sensíveis removidas do payload (registro do que foi sanitizado).
+  sanitizedKeys   String[]           @default([]) @map("sanitized_keys")
+  errorMessage    String?            @map("error_message")
+  correlationId   String?            @map("correlation_id") @db.VarChar(60)
+
+  tenant      Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoice     Invoice?           @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  integration FiscalIntegration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, createdAt])
+  @@index([invoiceId, createdAt])
+  @@index([integrationId, createdAt])
+  @@map("fiscal_logs")
+}
+
+/// Fila de operações fiscais. Toda emissão/cancelamento é assíncrono: a
+/// requisição cria o job, o worker chama o provedor e atualiza a nota. O
+/// usuário acompanha o status sem bloquear a interface.
+model FiscalJob {
+  id             String        @id @default(cuid())
+  tenantId       String        @map("tenant_id")
+  invoiceId      String?       @map("invoice_id")
+  type           FiscalJobType
+  status         JobStatus     @default(PENDING)
+  priority       Int           @default(0)
+  attempts       Int           @default(0)
+  maxAttempts    Int           @default(5) @map("max_attempts")
+  payload        Json?
+  result         Json?
+  errorMessage   String?       @map("error_message")
+  /// Fila lógica (ex.: "fiscal:emit", "fiscal:cancel"). Define o
+  /// particionamento e a prioridade.
+  queue          String        @db.VarChar(40)
+  scheduledAt    DateTime?     @map("scheduled_at")
+  startedAt      DateTime?     @map("started_at")
+  completedAt    DateTime?     @map("completed_at")
+  /// Idempotência: mesma chave não enfileira duas vezes.
+  idempotencyKey String?       @map("idempotency_key") @db.VarChar(120)
+  lockToken      String?       @map("lock_token") @db.VarChar(60)
+  lockedAt       DateTime?     @map("locked_at")
+  lockedBy       String?       @db.VarChar(80)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([status, queue, scheduledAt])
+  @@index([tenantId, status, createdAt])
+  @@index([invoiceId])
+  @@map("fiscal_jobs")
+}
+
+// ============================================================================
+// AUDITORIA
+//
+// Regras:
+// - `userId` é NULLABLE com `onDelete: SetNull` e o nome do usuário é
+//   desnormalizado em `userName`. Apagar um usuário NUNCA destrói o rastro.
+// - `changes` guarda apenas o DIFF (antes/depois) e passa por
+//   `redactAuditChanges`, que remove CPF/CNPJ/senha/token antes de gravar.
+// - Escrita é append-only. Não existe `updatedAt` nem rota de edição.
+// ============================================================================
+
+model AuditLog {
+  id                  String  @id @default(cuid())
+  tenantId            String  @map("tenant_id")
+  userId              String? @map("user_id")
+  /// Nome do autor no momento do fato (não depende do user ainda existir).
+  userName            String? @map("user_name") @db.VarChar(140)
+  userEmail           String? @map("user_email") @db.VarChar(180)
+  /// Sessão que originou a ação (permite revogar e correlacionar).
+  sessionId           String? @map("session_id")
+  /// Impersonação de super admin: sem isso, o log parece uma ação normal.
+  isImpersonation     Boolean @default(false) @map("is_impersonation")
+  impersonationReason String? @map("impersonation_reason") @db.VarChar(255)
+
+  action      AuditAction
+  /// Entidade afetada: "Sale", "Invoice", "User", "ChartOfAccount"...
+  entity      String      @db.VarChar(60)
+  entityId    String?     @map("entity_id") @db.VarChar(40)
+  description String?     @db.VarChar(500)
+  /// Diff antes/depois já sanitizado. Ver `redactAuditChanges`.
+  changes     Json?
+  /// Metadados não sensíveis (IP, user-agent, requestId, correlationId).
+  metadata    Json?
+  /// Webhook/api key usada, quando aplicável.
+  apiKeyId    String?     @map("api_key_id")
+
+  ip            String? @db.VarChar(64)
+  userAgent     String? @map("user_agent")
+  correlationId String? @map("correlation_id") @db.VarChar(60)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entity, entityId, createdAt])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, action, createdAt])
+  @@index([correlationId])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// LGPD E PRIVACIDADE
+// ============================================================================
+
+/// Registro de consentimento. Guardar a versão do termo é obrigatório: o
+/// consentimento dado para a v1.0 não cobre a v2.0.
+model ConsentLog {
+  id              String      @id @default(cuid())
+  userId          String?     @map("user_id")
+  /// Sujeito do tratamento quando é cliente final (LGPD), não usuário do ERP.
+  customerId      String?     @map("customer_id")
+  /// Finalidade: "marketing", "comunicacao", "analytics", "necessario".
+  purpose         String      @db.VarChar(80)
+  /// Versão do termo aceito.
+  documentVersion String      @map("document_version") @db.VarChar(20)
+  granted         Boolean
+  legalBasis      LegalBasis?
+  ip              String?     @db.VarChar(64)
+  userAgent       String?     @map("user_agent")
+  /// Hash do documento exibido, para provar o conteúdo aceito.
+  documentHash    String?     @map("document_hash") @db.VarChar(64)
+  notes           String?
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  grantedAt DateTime  @default(now()) @map("granted_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([customerId, purpose])
+  @@index([purpose, grantedAt])
+  @@index([tenantId])
+  @@map("consent_logs")
+}
+
+/// Solicitações do titular (art. 18 da LGPD). Prazo legal de resposta: 15
+/// dias. O job de rotina alerta sobre vencimento.
+model DataSubjectRequest {
+  id              String                   @id @default(cuid())
+  userId          String?                  @map("user_id")
+  customerId      String?                  @map("customer_id")
+  /// Protocolo curto exibido ao titular.
+  protocol        String                   @db.VarChar(20)
+  type            DataSubjectRequestType
+  status          DataSubjectRequestStatus @default(ABERTA)
+  legalBasis      LegalBasis?
+  description     String?                  @db.VarChar(1000)
+  /// Prazo legal de 15 dias.
+  dueAt           DateTime                 @map("due_at")
+  completedAt     DateTime?                @map("completed_at")
+  /// Evidência do atendimento (relatório, e-mail, hash de anonimização).
+  evidenceUrl     String?                  @map("evidence_url")
+  rejectionReason String?                  @map("rejection_reason")
+  handledById     String?                  @map("handled_by_id")
+
+  user      User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  customer  Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  handledBy User?     @relation("DataSubjectHandler", fields: [handledById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([protocol])
+  @@index([userId, status, type])
+  @@index([status, dueAt])
+  @@index([customerId])
+  @@index([tenantId])
+  @@map("data_subject_requests")
+}
+
+// ============================================================================
+// NOTIFICAÇÕES E SUPORTE
+// ============================================================================
+
+model Notification {
+  id          String               @id @default(cuid())
+  tenantId    String               @map("tenant_id")
+  /// Destinatário. NULL = notificação para toda a empresa (broadcast).
+  userId      String?              @map("user_id")
+  type        NotificationType
+  priority    NotificationPriority @default(NORMAL)
+  title       String               @db.VarChar(200)
+  message     String               @db.VarChar(1000)
+  /// Entidade relacionada, para "ir para" a tela certa.
+  entity      String?              @db.VarChar(60)
+  entityId    String?              @map("entity_id")
+  linkUrl     String?              @map("link_url")
+  /// Persistir depois de ler?false = some ao ler.
+  persistent  Boolean              @default(false)
+  readAt      DateTime?            @map("read_at")
+  dismissedAt DateTime?            @map("dismissed_at")
+  expiresAt   DateTime?            @map("expires_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User?  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, userId, readAt])
+  @@index([tenantId, type, createdAt])
+  @@index([tenantId, createdAt])
+  @@map("notifications")
+}
+
+model SupportTicket {
+  id                 String         @id @default(cuid())
+  tenantId           String         @map("tenant_id")
+  /// Protocolo curto exibido ao cliente.
+  protocol           String         @db.VarChar(20)
+  subject            String         @db.VarChar(200)
+  description        String         @db.Text
+  status             TicketStatus   @default(ABERTO)
+  priority           TicketPriority @default(MEDIA)
+  category           String?        @db.VarChar(60)
+  openedById         String?        @map("opened_by_id")
+  assignedToId       String?        @map("assigned_to_id")
+  /// O problema é do produto ou do cliente? Ajuda a separar suporte de bug.
+  isProductIssue     Boolean        @default(false) @map("is_product_issue")
+  /// Versão do app reportada pelo cliente (para triagem de bug).
+  appVersion         String?        @map("app_version") @db.VarChar(20)
+  attachments        Json?
+  closedAt           DateTime?      @map("closed_at")
+  closedReason       String?        @map("closed_reason")
+  /// Tempo de primeira resposta e de resolução, para SLA.
+  firstResponseAt    DateTime?      @map("first_response_at")
+  resolvedAt         DateTime?      @map("resolved_at")
+  satisfactionRating Int?           @map("satisfaction_rating")
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  openedBy   User?            @relation("TicketOpener", fields: [openedById], references: [id], onDelete: SetNull)
+  assignedTo User?            @relation("TicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages   SupportMessage[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([tenantId, protocol])
+  @@index([tenantId, status, priority])
+  @@index([tenantId, assignedToId, status])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id          String    @id @default(cuid())
+  ticketId    String    @map("ticket_id")
+  authorId    String?   @map("author_id")
+  /// false = mensagem do cliente; true = resposta do suporte.
+  fromSupport Boolean   @default(false) @map("from_support")
+  body        String    @db.Text
+  attachments Json?
+  readAt      DateTime? @map("read_at")
+  /// Mensagens internas visíveis só para a equipe de suporte.
+  internal    Boolean   @default(false)
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User?         @relation("SupportMessageAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // --- Escopo de tenant (ver docs/adr/0002-tenant-isolation.md) ---
+  /// Coluna fisica: e o que a extensao `tenant-guard` filtra e o que o
+  /// indice cobre. Preenchida a partir do pai no momento da gravacao.
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+  @@index([authorId])
+  @@index([tenantId])
+  @@map("support_messages")
+}
