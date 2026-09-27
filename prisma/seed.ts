@@ -1,7 +1,9 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "../src/generated/prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import bcrypt from "bcryptjs";
 
-const prisma = new PrismaClient();
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   console.log("🌱 Iniciando seed do super admin...");
@@ -20,6 +22,35 @@ async function main() {
   // Hash da senha (cost 12 = padrão do projeto)
   const passwordHash = await bcrypt.hash(password, 12);
 
+  // Cria plano básico (gratuito/ilimitado para o admin)
+  const plan = await prisma.plan.upsert({
+    where: { code: "admin-unlimited" },
+    update: {},
+    create: {
+      code: "admin-unlimited",
+      name: "Admin Ilimitado",
+      description: "Plano ilimitado para super admin",
+      priceCents: 0,
+      annualPriceCents: 0,
+      currency: "BRL",
+      billingPeriod: "MENSAL",
+      trialDays: 0,
+      maxUsers: 0,
+      maxProducts: 0,
+      maxCustomers: 0,
+      maxSuppliers: 0,
+      maxBranches: 0,
+      maxInvoicesPerMonth: 0,
+      maxSalesPerMonth: 0,
+      maxStorageMb: 0,
+      features: ["*"],
+      sortOrder: 0,
+      highlight: true,
+      active: true,
+    },
+  });
+  console.log("✅ Plano criado:", plan.code);
+
   // Cria tenant (empresa)
   const tenant = await prisma.tenant.create({
     data: {
@@ -27,6 +58,8 @@ async function main() {
       slug: "marcio-sistemas",
       status: "ATIVA",
       primaryColor: "#2224731",
+      planId: plan.id,
+      subscriptionStatus: "ATIVA",
     },
   });
   console.log("✅ Tenant criado:", tenant.name);
@@ -58,18 +91,23 @@ async function main() {
 
   // Cria role de sistema (opcional - para RBAC)
   const systemRole = await prisma.role.upsert({
-    where: { key: "system.super_admin" },
+    where: {
+      tenantId_slug: {
+        tenantId: null,
+        slug: "super-admin",
+      },
+    },
     update: {},
     create: {
-      key: "system.super_admin",
+      tenantId: null,
+      slug: "super-admin",
       name: "Super Admin do Sistema",
       description: "Acesso total à plataforma (super admin cross-tenant)",
       isSystem: true,
-      tenantId: null,
       active: true,
     },
   });
-  console.log("✅ Role de sistema criada:", systemRole.key);
+  console.log("✅ Role de sistema criada:", systemRole.id);
 
   // Vincula role ao membership
   await prisma.membershipRole.create({
