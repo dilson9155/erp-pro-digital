@@ -26,6 +26,18 @@ export const QUANTITY_SCALE = 4;
 /** Arredondamento padrao. Ver NOTA acima. */
 export const ROUNDING = Decimal.ROUND_HALF_UP;
 
+/**
+ * Qualquer valor que possa virar dinheiro.
+ *
+ * `Decimal.Value` aceita `Decimal`, `number` e `string`. Este alias existe
+ * porque a alternativa — `Decimal` puro nos campos de saida — obriga quem
+ * calcula a fazer `toDecimal()` em cada fronteira, e o `toDecimal()` esquecido
+ * em um deles vira `any` silencioso em vez de erro de compilacao. Nos SCHEMAS,
+ * todo dinheiro entra por `zMoney()`/`parseBrazilianNumber` e ja chega como
+ * `Decimal`; o alias cobre so a passagem entre camadas.
+ */
+export type DecimalLike = Decimal.Value;
+
 const decimalConfig = {
   precision: 28,
   rounding: ROUNDING,

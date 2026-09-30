@@ -42,6 +42,16 @@ export async function buscarMembershipAtivas(userId: string) {
   }));
 }
 
+/**
+ * Membership ativa pelo id, com o nome do tenant.
+ *
+ * `tenant.name` vem junto porque quase toda tela de negocio precisa do nome da
+ * empresa no cabecalho ou no `<title>`, e carregar isso em uma consulta separada
+ * por pagina seria um desperdicio repetido. `branchAccess` vem no mesmo SELECT
+ * de proposito: o `TenantScope.allowedBranchIds` e derivado dele, e buscar em
+ * separado abriria uma janela em que o vinculo de filial muda entre a checagem
+ * e o uso.
+ */
 export async function buscarMembershipAtivaPorId(membershipId: string | null) {
   if (!membershipId) return null;
   return prismaCommon.membership.findFirst({
@@ -51,6 +61,7 @@ export async function buscarMembershipAtivaPorId(membershipId: string | null) {
       tenantId: true,
       userId: true,
       isOwner: true,
+      tenant: { select: { name: true } },
       branchAccess: { select: { branchId: true } },
     },
   });

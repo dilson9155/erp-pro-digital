@@ -1158,12 +1158,14 @@ model BillingInvoice {
   externalId      String?              @unique @map("external_id")
   receiptUrl      String?              @map("receipt_url")
 
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription Subscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+  // Fatura da plataforma: nao tem `branchId` (e nao e documento de filial), e a
+  // numeracao e global da assinatura. Unico por tenant, e nao por filial.
   @@unique([tenantId, number])
   @@index([tenantId, status, dueDate])
   @@map("billing_invoices")
@@ -2279,7 +2281,11 @@ model StockTransfer {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  // A serie e da filial de ORIGEM: e dela que a transferencia sai, e e por ela
+  // que o estoque sai. A filial de destino recebe os movimentos depois. Usar
+  // `destinationBranchId` faria a mesma transferencia ter numeros diferentes
+  // conforme quem recebe, e o `@@unique` deixaria de proteger a serie.
+  @@unique([tenantId, originBranchId, number])
   @@index([tenantId, status])
   @@index([tenantId, originBranchId, destinationBranchId])
   @@map("stock_transfers")
@@ -2342,7 +2348,7 @@ model Inventory {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@index([tenantId, status])
   @@index([tenantId, branchId, type])
   @@map("inventories")
@@ -2459,7 +2465,7 @@ model Quote {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@index([tenantId, status, validUntil])
   @@index([tenantId, customerId])
   @@index([tenantId, branchId, createdAt])
@@ -2549,7 +2555,7 @@ model SalesOrder {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, status, requestedDeliveryDate])
   @@index([tenantId, customerId])
@@ -2671,7 +2677,7 @@ model Sale {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, status, soldAt])
   @@index([tenantId, customerId, soldAt])
@@ -2820,7 +2826,7 @@ model SaleReturn {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@index([tenantId, saleId])
   @@index([tenantId, status, returnedAt])
   @@map("sale_returns")
@@ -3299,7 +3305,7 @@ model AccountsReceivable {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@index([tenantId, status, dueDate])
   @@index([tenantId, customerId, status])
   @@index([tenantId, kind, dueDate])
@@ -3347,7 +3353,7 @@ model AccountsPayable {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@index([tenantId, status, dueDate])
   @@index([tenantId, supplierId, status])
   @@index([tenantId, kind, dueDate])
@@ -3441,7 +3447,7 @@ model Purchase {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  @@unique([tenantId, number])
+  @@unique([tenantId, branchId, number])
   @@unique([tenantId, fiscalAccessKey])
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, status, orderDate])

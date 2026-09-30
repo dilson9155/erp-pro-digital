@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Building2, ChevronDown, ChevronRight, LogOut, Settings } from "lucide-react";
+import { Building2, ChevronDown, ChevronRight, FolderTree, LogOut, Settings } from "lucide-react";
 import { encerrarSessao } from "@/server/app/auth";
 import { branding } from "@/config/branding";
 
@@ -62,6 +62,23 @@ export function NavLateral(props: PropsNavLateral) {
                 {item.icone ? <item.icone className="size-4" /> : null}
                 {item.rotulo}
               </Link>
+              {/* Filhos no mesmo nivel, e nao em submenu recolhivel. Um submenu
+                  esconderia quatro cadastros atras de um clique, e quem procura
+                  "clientes" nao sabe que existe um grupo "Cadastros". */}
+              {item.filhos && item.filhos.length > 0 ? (
+                <ul className="ml-4 space-y-0.5 border-l pl-2">
+                  {item.filhos.map((filho) => (
+                    <li key={filho.href}>
+                      <Link
+                        href={filho.href}
+                        className="block rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        {filho.rotulo}
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
             </li>
           ))}
         </ul>
@@ -145,17 +162,37 @@ function LinkEscolherEmpresa() {
 }
 
 /**
- * Menu da FASE 1.
+ * Menu do sistema.
  *
- * Os itens sao literais, e nao derivados de permissao: cada pagina criada ate
- * agora valida a propria permissao no servidor, entao esconder o item aqui
- * seria uma segunda fonte de verdade para o mesmo fato. A navegacao por
- * permissoes entra junto com os modulos de negocio, quando o item tiver uma
- * tela real atras dele.
- */
-function itensDoMenu(): readonly ItemMenu[] {
+ * Os itens sao literais, e nao derivados de permissao: cada pagina valida a
+ * propria permissao no servidor, entao esconder o item aqui seria uma segunda
+ * fonte de verdade para o mesmo fato. Uma pessoa sem permissao de unidade vera
+ * o link e recebera um 404 ao clicar — o que e o comportamento correto, porque
+ * o menu descobre o que a empresa usa, e nao o que a pessoa pode fazer.
+ *
+ * Mover essa logica para o layout custaria uma consulta de RBAC a cada
+ * navegacao, por causa de menos dados, e criaria a possibilidade de o item sumir
+ * e a pessoa achar que a tela foi deletada.
+ */function itensDoMenu(): readonly ItemMenu[] {
   return [
     { href: "/dashboard", rotulo: "Visao geral" },
+    {
+      href: "/cadastros",
+      rotulo: "Cadastros",
+      icone: FolderTree,
+      filhos: [
+        { href: "/cadastros/unidades", rotulo: "Unidades de medida" },
+        { href: "/cadastros/categorias", rotulo: "Categorias" },
+        { href: "/cadastros/marcas", rotulo: "Marcas" },
+        { href: "/cadastros/produtos", rotulo: "Produtos" },
+        { href: "/cadastros/clientes", rotulo: "Clientes" },
+        { href: "/cadastros/fornecedores", rotulo: "Fornecedores" },
+      ],
+    },
+    {
+      href: "/vendas",
+      rotulo: "Vendas",
+    },
     { href: "/configuracoes", rotulo: "Configuracoes", icone: Settings, filhos: [] },
   ];
 }

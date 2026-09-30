@@ -58,6 +58,7 @@
 import { prismaCommon } from "@/server/db/client";
 import { AppError, ErrorCode, type ErrorCodeValue } from "@/lib/errors";
 import { chavePermissao, type PedidoPermissao } from "@/lib/rbac/permissions";
+import { PREFIXO_PLATFORM } from "@/lib/rbac/catalogo";
 import { RoleScope, SubscriptionStatus } from "@/generated/prisma/enums";
 import type { PlanModuleKey } from "@/generated/prisma/enums";
 
@@ -264,10 +265,19 @@ async function planoDoTenant(
   concedidas: readonly PermissaoEfetiva[],
 ): Promise<{ modulosFaltantes: readonly string[]; assinaturaBloqueada: boolean }> {
   // Modulos distintos exigidos pelas permissoes concedidas.
+  //
+  // `platform.*` fica DE FORA do cruzamento, e o motivo esta no docblock de
+  // `moduloDaChave`: permissao de plataforma nao pertence a nenhum modulo
+  // contratado, logo nao tem o que ser verificado contra o plano. A primeira
+  // versao deste loop nao filtrava, e o efeito era o oposto do desejado — um
+  // usuario que recebia `platform.usuario` derrubava o conjunto INTEIRO de
+  // permissoes, porque o cruzamento tratava `platform` como modulo contratado
+  // que o plano nao tem. O sintoma era o administrador perder o acesso a tudo
+  // assim que a concessao de usuario era salva, e a causa aparente era o seed.
   const exigidos = new Set<string>();
   for (const p of concedidas) {
     const modulo = moduloDaChave(p.key);
-    if (modulo) exigidos.add(modulo);
+    if (modulo && modulo !== PREFIXO_PLATFORM) exigidos.add(modulo);
   }
   if (exigidos.size === 0) {
     // Nenhuma permissao de modulo de produto (so `platform.*`): o gate de plano

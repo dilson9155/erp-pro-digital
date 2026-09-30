@@ -1,8 +1,12 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["dom", "dom.iterable", "ES2023"],
-    "jsx": "preserve",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "ES2023"
+    ],
+    "jsx": "react-jsx",
     "module": "esnext",
     "moduleResolution": "bundler",
     "allowJs": false,
@@ -23,9 +27,15 @@
     "exactOptionalPropertyTypes": false,
     "forceConsistentCasingInFileNames": true,
     "useUnknownInCatchVariables": true,
-    "plugins": [{ "name": "next" }],
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": [
+        "./src/*"
+      ]
     }
   },
   "include": [
@@ -36,5 +46,9 @@
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules", ".next", "src/generated", "prisma"]
+  "exclude": [
+    "node_modules",
+    ".next",
+    "src/generated"
+  ]
 }

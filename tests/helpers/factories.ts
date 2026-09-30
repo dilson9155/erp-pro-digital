@@ -370,3 +370,218 @@ export async function createRole(
 export async function attachRole(membershipId: string, roleId: string) {
   return testDb().membershipRole.create({ data: { membershipId, roleId } });
 }
+
+/**
+ * Cenario de estoque: tenant, filial, unidade, categoria e produtos.
+ *
+ * A cadeia e longa e a ordem e livre de escolha — `Product` exige `unitId`, que
+ * exige `tenantId`; `StockItem` exige os tres. Montar isso em cada teste
+ * repetiria a ordem, e um erro de ordem se parece com bug de logica: o
+ * `create` falha e o teste aponta a linha errada.
+ */
+export interface CenarioEstoque {
+  readonly tenant: { id: string };
+  readonly branch: { id: string };
+  readonly produtos: {
+    /** MERCADORIA com saldo. */
+    readonly mercadoria: { id: string };
+    /** Segunda mercadoria, para testar travamento em ordem. */
+    readonly outraMercadoria: { id: string };
+    /** `type: SERVICO` em `Product`: item de NFS-e, sem saldo. */
+    readonly servicoNfs: { id: string };
+  };
+  /** `Service` do catalogo de servicos: TABELA SEPARADA de `Product`. */
+  readonly servicos: {
+    readonly instalacao: { id: string };
+  };
+}
+
+export async function createCenarioEstoque(): Promise<CenarioEstoque> {
+  const { tenant, branch } = await createTenantWithBranch();
+
+  const unidade = await testDb().unit.create({
+    data: { tenantId: tenant.id, name: "UN" },
+  });
+  const categoria = await testDb().category.create({
+    data: { tenantId: tenant.id, name: "Geral" },
+  });
+
+  const criarProduto = (nome: string, sku: string, type: "MERCADORIA" | "SERVICO" = "MERCADORIA") =>
+    testDb().product.create({
+      data: {
+        tenantId: tenant.id,
+        unitId: unidade.id,
+        categoryId: categoria.id,
+        type,
+        sku,
+        name: nome,
+        unitPrice: 10,
+        active: true,
+      },
+    });
+
+  const [mercadoria, outraMercadoria, servicoNfs] = await Promise.all([
+    criarProduto("Teclado", "TEC-001"),
+    criarProduto("Mouse", "MOU-001"),
+    criarProduto("Consultoria NFS-e", "SRV-001", "SERVICO"),
+  ]);
+
+  // `Service` NAO e um `Product` com `type: SERVICO`. Sao dois modelos, duas
+  // tabelas e duas FKs em `SaleItem`. A fabricada existe para provar isso.
+  const servicoInstalacao = await testDb().service.create({
+    data: {
+      tenantId: tenant.id,
+      branchId: branch.id,
+      unitId: unidade.id,
+      categoryId: categoria.id,
+      code: "SRV-001",
+      name: "Instalacao",
+      unitPrice: 150,
+      active: true,
+    },
+  });
+
+  return {
+    tenant,
+    branch,
+    produtos: { mercadoria, outraMercadoria, servicoNfs },
+    servicos: { instalacao: servicoInstalacao },
+  };
+}
+
+/**
+ * Linha de estoque com saldo e custo medio.
+ *
+ * `averageCost` e `totalValue` sao passados separados porque e a unica forma de
+ * montar um saldo que o `movimento.ts` nao produziria sozinho: um saldo com
+ * media e valor total coerentes vem de uma compra, e o teste precisa de um saldo
+ * inicial antes de qualquer compra existir.
+ */
+export async function createStockItem(
+  tenantId: string,
+  branchId: string,
+  productId: string,
+  opcoes: { readonly quantity?: string; readonly reserved?: string; readonly averageCost?: string } = {},
+) {
+  const quantity = opcoes.quantity ?? "10";
+  const averageCost = opcoes.averageCost ?? "5";
+  return testDb().stockItem.create({
+    data: {
+      tenantId,
+      branchId,
+      productId,
+      quantity,
+      reservedQuantity: opcoes.reserved ?? "0",
+      averageCost,
+      totalValue: Number(quantity) * Number(averageCost),
+    },
+  });
+}
+
+/** Item de rascunho: um de `productId`/`serviceId`, exatamente como `SaleItem`. */
+export interface ItemSaleRascunho {
+  readonly productId?: string | null;
+  readonly serviceId?: string | null;
+  readonly description?: string;
+  readonly quantity: string;
+  readonly unitPrice: string;
+}
+
+/** Opcoes do rascunho: o que a tela tambem grava no cabecalho. */
+export interface OpcoesSaleRascunho {
+  readonly paymentTermsId?: string | null;
+  readonly paymentMethodId?: string | null;
+  readonly customerId?: string | null;
+  readonly status?: "RASCUNHO" | "PENDENTE";
+  readonly soldAt?: Date | null;
+}
+
+/** Venda em rascunho, com o numero que a baixa usa no documento. */
+export async function createSaleRascunho(
+  tenantId: string,
+  branchId: string,
+  numero: string,
+  itens: readonly ItemSaleRascunho[],
+  opcoes: OpcoesSaleRascunho = {},
+) {
+  return testDb().sale.create({
+    data: {
+      tenantId,
+      branchId,
+      number: numero,
+      status: opcoes.status ?? "RASCUNHO",
+      type: "BALCAO",
+      channel: "BALCAO",
+      paymentTermsId: opcoes.paymentTermsId ?? null,
+      paymentMethodId: opcoes.paymentMethodId ?? null,
+      customerId: opcoes.customerId ?? null,
+      soldAt: opcoes.soldAt ?? null,
+      subtotal: itens.reduce((s, i) => s + Number(i.quantity) * Number(i.unitPrice), 0),
+      total: itens.reduce((s, i) => s + Number(i.quantity) * Number(i.unitPrice), 0),
+      items: {
+        create: itens.map((item, indice) => ({
+          tenantId,
+          productId: item.productId ?? null,
+          serviceId: item.serviceId ?? null,
+          description: item.description ?? "Item de teste",
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          total: Number(item.quantity) * Number(item.unitPrice),
+          sortOrder: indice,
+        })),
+      },
+    },
+  });
+}
+
+/**
+ * Condicao de pagamento para os testes de financeiro.
+ *
+ * O teste precisa de um termo com desconto a vista de verdade (o bug que
+ * somava o desconto as parcelas) e de um parcelado para o recebimento parcial,
+ * entao a fabrica aceita so os campos que esses dois casos usam.
+ */
+export async function createPaymentTerms(
+  tenantId: string,
+  opcoes: {
+    readonly branchId?: string | null;
+    readonly type?: "A_VISTA" | "DIAS" | "DIAS_RECEBIMENTO" | "DIA_FIXO" | "PARCELADO" | "CUSTOM";
+    readonly installmentCount?: number;
+    readonly intervalDays?: number;
+    readonly cashDiscountCents?: number;
+    readonly name?: string;
+  } = {},
+) {
+  return testDb().paymentTerms.create({
+    data: {
+      tenantId,
+      branchId: opcoes.branchId ?? null,
+      name: opcoes.name ?? "Condicao de Teste",
+      type: opcoes.type ?? "A_VISTA",
+      installmentCount: opcoes.installmentCount ?? 1,
+      intervalDays: opcoes.intervalDays ?? 0,
+      cashDiscountCents: opcoes.cashDiscountCents ?? 0,
+      active: true,
+    },
+  });
+}
+
+/** Forma de pagamento, para o recebimento imediato da confirmacao. */
+export async function createPaymentMethod(
+  tenantId: string,
+  opcoes: {
+    readonly branchId?: string | null;
+    readonly type?: "DINHEIRO" | "PIX" | "CARTAO_DEBITO" | "CARTAO_CREDITO" | "BOLETO" | "TRANSFERENCIA" | "CHEQUE" | "CREDITO_PROPRIO" | "OUTRO";
+    readonly name?: string;
+  } = {},
+) {
+  return testDb().paymentMethod.create({
+    data: {
+      tenantId,
+      branchId: opcoes.branchId ?? null,
+      code: `M${unique().slice(-5).toUpperCase()}`,
+      name: opcoes.name ?? "Dinheiro",
+      type: opcoes.type ?? "DINHEIRO",
+    },
+  });
+}
