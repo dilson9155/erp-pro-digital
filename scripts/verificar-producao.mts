@@ -79,6 +79,45 @@ async function main(): Promise<void> {
     console.log(
       `[verificar-producao] seed aplicado: ${Number(users.rows[0]?.count ?? 0) > 0}`,
     );
+
+    // --- O INVARIANTE QUE QUEBRA A VENDA -----------------------------------
+    //
+    // `resolverRbac` so concede uma permissao se (a) o perfil a concede E (b) o
+    // plano do tenant contrata o modulo dela. Qualquer um dos dois lados
+    // faltando, a pagina responde `notFound()` - que e um 404 sem pista de que
+    // a causa foi permissao, e nao rota inexistente. Por isso as duas metidas
+    // sao contadas aqui: elas separam "perfil sem concessao" de
+    // "plano sem modulo contratado".
+    const perfilComVendas = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM role_permissions rp
+         JOIN permissions p ON p.id = rp.permission_id
+        WHERE p.module = 'VENDAS'`,
+    );
+    console.log(
+      `[verificar-producao] concessoes de perfil em VENDAS: ${perfilComVendas.rows[0]?.count}`,
+    );
+
+    const modulosDoPlano = await client.query<{ modulos: string }>(
+      `SELECT count(*)::text AS modulos
+         FROM plan_modules pm
+         JOIN plans p ON p.id = pm.plan_id
+        WHERE p.code = 'admin-unlimited'`,
+    );
+    console.log(
+      `[verificar-producao] modulos contratados no plano admin-unlimited: ${modulosDoPlano.rows[0]?.modulos}`,
+    );
+
+    const vendasNoPlano = await client.query<{ existe: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM plan_modules pm
+           JOIN plans p ON p.id = pm.plan_id
+          WHERE p.code = 'admin-unlimited' AND pm.module = 'VENDAS'
+       ) AS existe`,
+    );
+    console.log(
+      `[verificar-producao] plano contrata VENDAS: ${vendasNoPlano.rows[0]?.existe === true}`,
+    );
   } finally {
     await client.end();
   }

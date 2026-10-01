@@ -1,4 +1,4 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "npx prisma migrate deploy && npx tsx scripts/verificar-producao.mts && npm run build"
+  "buildCommand": "npx prisma migrate deploy && npm run db:seed && npx tsx scripts/verificar-producao.mts && npm run build"
 }
